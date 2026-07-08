@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Secrets — never commit credentials. The ngrok authtoken lives in the
+# machine's ngrok config (AppData / ~/.config/ngrok), NOT in this repo.
+*.secret
+.env
+ngrok.yml
+
+# NOTE: printer-receiver/logs/raw_alerts.jsonl IS committed on purpose —
+# the captured payload log is the Phase 0 deliverable. It appends over time;
+# expect to resolve it as a snapshot when syncing across devices.

@@ -1,0 +1,435 @@
+//@version=6
+indicator("Printer — SMT Publisher", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ATTRIBUTION
+// Detection core adapted from "SMT Divergences [LuxAlgo]" © LuxAlgo,
+// licensed CC BY-NC-SA 4.0 (https://creativecommons.org/licenses/by-nc-sa/4.0/).
+// Private, non-redistributed, non-commercial use within this trading stack;
+// this file must never be published or sold (docs/decisions.md).
+//
+// WHY THIS EXISTS
+// Self-authored SMT detection → JSON webhook → server combines
+// (docs/architecture.md). The LuxAlgo mechanism (trader-selected 2026-07-05):
+// hold each symbol's last confirmed pivot via fixnan; when BOTH symbols
+// confirm a new pivot on the same bar, the swing-direction sign product
+// (delta_chart * delta_comparison < 0) detects divergence. Supports two
+// comparison symbols (ES + YM) like the trader's model requires.
+// Payloads carry "source":"printer"; the vendor SMT runs in parallel during
+// calibration and the server diffs the streams.
+// Detection only — strategy conditions live in the server, never here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Configuration ────────────────────────────────────────────────────────────
+group_detect = "Detection (LuxAlgo core)"
+group_display = "Display / alerts"
+
+// WHY 1: a swing must beat this many candles on EACH side. 1 = the 3-candle
+// fractal — the smallest structure the eye reads as a swing, which is what
+// the model wants on the 1m stream. Raise for bigger structure only.
+pivot_length = input.int(1, "Pivot lookback", minval = 1, group = group_detect)
+// WHY: the comparison symbol's swing rarely prints on the exact same bar —
+// its extreme is read from a window of this many bars around the chart
+// symbol's swing. Evaluation waits until the window is fully formed, which
+// reproduces the ~2-bar formation lag observed in the vendor's own alerts.
+comparison_window = input.int(2, "Comparison window (bars around swing)", minval = 0, maxval = 5, group = group_detect)
+
+use_comparison_1 = input.bool(true, "Comparison symbol 1", inline = "symA", group = group_detect)
+comparison_symbol_1 = input.symbol("CME_MINI:ES1!", "", inline = "symA", group = group_detect)
+pair_label_1 = input.string("NQ-ES", "Pair label 1", group = group_detect)
+
+use_comparison_2 = input.bool(false, "Comparison symbol 2", inline = "symB", group = group_detect)
+comparison_symbol_2 = input.symbol("CBOT_MINI:YM1!", "", inline = "symB", group = group_detect)
+pair_label_2 = input.string("NQ-YM", "Pair label 2", group = group_detect)
+
+// WHY HTF layers: the model reads SMTs on H4 and 15m as standing structure —
+// they must be visible AT ALL TIMES on the trading chart (trader ruling
+// 2026-07-05), regardless of the zone filter that declutters chart-TF marks.
+// Layers only run when the chart TF is below them (no self-duplication).
+group_mtf = "Higher-timeframe SMT layers"
+show_15m_smts = input.bool(true, "Detect + show 15m SMTs", group = group_mtf)
+show_h4_smts  = input.bool(true, "Detect + show 4H SMTs", group = group_mtf)
+htf_pivot_length = input.int(1, "HTF pivot lookback", minval = 1, group = group_mtf)
+
+fire_formation_alerts = input.bool(true, "Fire formation webhooks", group = group_display)
+fire_breakage_alerts  = input.bool(true, "Fire breakage webhooks", group = group_display)
+show_marks            = input.bool(true, "Mark detections on the chart", group = group_display)
+show_zone_bands       = input.bool(true, "Highlight manipulation bands", group = group_display)
+// WHY display-only: only zone-relevant SMTs are worth eyes (trader ruling
+// 2026-07-05) — a mark draws when a leg touches the manipulation band or the
+// band was tapped within the recency window. WEBHOOKS stay unfiltered: the
+// parallel-run diff needs the full stream and authoritative zone association
+// is the server's. Falls back to side-of-4H-open where per-slot band history
+// is insufficient (1m charts).
+display_filter_mode = input.string("Zone contact", "Mark filter", options = ["Zone contact", "Side of 4H open", "Off"], group = group_display)
+// WHY 30: trader ruling — "recently tapped" = within 2 fifteen-minute candles.
+zone_tap_recency_minutes = input.int(30, "Zone tap recency for marks (minutes)", minval = 0, group = group_display)
+
+// WHY: pair labels are embedded verbatim in JSON — quotes/backslashes would
+// corrupt every payload (and TradingView silently downgrades invalid JSON to
+// text/plain).
+if str.contains(pair_label_1, "\"") or str.contains(pair_label_1, "\\") or str.contains(pair_label_2, "\"") or str.contains(pair_label_2, "\\")
+    runtime.error("Pair labels must not contain quote or backslash characters — they are embedded verbatim in JSON payloads")
+// WHY: the vendor-compatible timeframe token is only defined in whole minutes.
+if not timeframe.isminutes
+    runtime.error("SMT Publisher must run on a minutes chart (1m/15m) — the vendor timeframe token is only defined for minute timeframes")
+
+// ── Comparison symbol data ───────────────────────────────────────────────────
+
+// Same timeframe, lookahead off — pivots are judged on confirmed bars only.
+comparison_1_high = request.security(comparison_symbol_1, timeframe.period, high, lookahead = barmerge.lookahead_off)
+comparison_1_low  = request.security(comparison_symbol_1, timeframe.period, low,  lookahead = barmerge.lookahead_off)
+comparison_2_high = request.security(comparison_symbol_2, timeframe.period, high, lookahead = barmerge.lookahead_off)
+comparison_2_low  = request.security(comparison_symbol_2, timeframe.period, low,  lookahead = barmerge.lookahead_off)
+
+// Current 4H candle's open/time — anchor for the display filter.
+[current_h4_open, current_h4_time] = request.security(syminfo.tickerid, "240", [open, time], lookahead = barmerge.lookahead_on)
+
+// ── Higher-timeframe swing sources ───────────────────────────────────────────
+
+// Evaluated INSIDE each timeframe's context. Committed-close semantics
+// WITHOUT barstate in the security context (documented-unreliable there —
+// review finding 2026-07-05): updates run unconditionally and the [1]
+// offset returns only values COMMITTED at the last closed bar of that
+// timeframe — mid-bar flicker is rolled back, never observed.
+f_held_swings() =>
+    ph = ta.pivothigh(htf_pivot_length, htf_pivot_length)
+    pl = ta.pivotlow(htf_pivot_length, htf_pivot_length)
+    var float held_high = na
+    var int   held_high_time = na
+    var float held_low = na
+    var int   held_low_time = na
+    if not na(ph)
+        held_high := ph
+        held_high_time := time[htf_pivot_length]
+    if not na(pl)
+        held_low := pl
+        held_low_time := time[htf_pivot_length]
+    [held_high[1], held_high_time[1], held_low[1], held_low_time[1]]
+
+[m15_chart_high, m15_chart_high_t, m15_chart_low, m15_chart_low_t] = request.security(syminfo.tickerid, "15", f_held_swings(), lookahead = barmerge.lookahead_off)
+[m15_comp1_high, m15_comp1_high_t, m15_comp1_low, m15_comp1_low_t] = request.security(comparison_symbol_1, "15", f_held_swings(), lookahead = barmerge.lookahead_off)
+[m15_comp2_high, m15_comp2_high_t, m15_comp2_low, m15_comp2_low_t] = request.security(comparison_symbol_2, "15", f_held_swings(), lookahead = barmerge.lookahead_off)
+[h4_chart_high, h4_chart_high_t, h4_chart_low, h4_chart_low_t] = request.security(syminfo.tickerid, "240", f_held_swings(), lookahead = barmerge.lookahead_off)
+[h4_comp1_high, h4_comp1_high_t, h4_comp1_low, h4_comp1_low_t] = request.security(comparison_symbol_1, "240", f_held_swings(), lookahead = barmerge.lookahead_off)
+[h4_comp2_high, h4_comp2_high_t, h4_comp2_low, h4_comp2_low_t] = request.security(comparison_symbol_2, "240", f_held_swings(), lookahead = barmerge.lookahead_off)
+
+run_15m_layer = show_15m_smts and timeframe.in_seconds() < timeframe.in_seconds("15")
+run_h4_layer  = show_h4_smts and timeframe.in_seconds() < timeframe.in_seconds("240")
+
+// ── Manipulation-band reconstruction (display filter only) ───────────────────
+
+// Duplicates the CALIBRATED zone formula (per-slot 60-trading-day windows,
+// wick opposing close, percent of open, mean + standard median — see
+// docs/decisions.md "Zone geometry source") for the two manipulation bands.
+// The Zone Publisher remains the server's source of truth; this is chart
+// hygiene.
+MANIP_LOOKBACK_SAMPLES = 60
+
+[band_h4_open, band_h4_high, band_h4_low, band_h4_close, band_h4_time] = request.security(syminfo.tickerid, "240", [open[1], high[1], low[1], close[1], time[1]], lookahead = barmerge.lookahead_on)
+
+f_slot_index(_open_time) =>
+    int((hour(_open_time, "America/New_York") * 60 + minute(_open_time, "America/New_York")) / 240)
+
+var array<int> manip_sample_slots = array.new<int>()
+var array<float> manip_sample_values = array.new<float>()
+var int band_prev_bucket = na
+
+if current_h4_time != nz(band_prev_bucket)
+    // Just-completed candle's sample (dojis excluded per the calibrated config).
+    if not na(band_prev_bucket) and not na(band_h4_open) and band_h4_close != band_h4_open
+        band_bull = band_h4_close >= band_h4_open
+        band_manip_raw = band_bull ? band_h4_open - band_h4_low : band_h4_high - band_h4_open
+        array.push(manip_sample_slots, f_slot_index(band_h4_time))
+        array.push(manip_sample_values, band_manip_raw / band_h4_open * 100)
+        if array.size(manip_sample_values) > 3000
+            array.shift(manip_sample_slots)
+            array.shift(manip_sample_values)
+    band_prev_bucket := current_h4_time
+
+f_manip_stats(_slot) =>
+    vals = array.new<float>()
+    total = array.size(manip_sample_values)
+    if total > 0
+        for i = total - 1 to 0
+            if array.size(vals) >= MANIP_LOOKBACK_SAMPLES
+                break
+            if array.get(manip_sample_slots, i) == _slot
+                array.push(vals, array.get(manip_sample_values, i))
+    n = array.size(vals)
+    [n > 0 ? array.avg(vals) : na, n > 0 ? array.median(vals) : na, n]
+
+[manip_mean, manip_median, manip_sample_count] = f_manip_stats(f_slot_index(current_h4_time))
+zone_bands_valid = manip_sample_count >= MANIP_LOOKBACK_SAMPLES
+
+bull_band_top    = math.max(current_h4_open * (1 - manip_mean / 100), current_h4_open * (1 - manip_median / 100))
+bull_band_bottom = math.min(current_h4_open * (1 - manip_mean / 100), current_h4_open * (1 - manip_median / 100))
+bear_band_top    = math.max(current_h4_open * (1 + manip_mean / 100), current_h4_open * (1 + manip_median / 100))
+bear_band_bottom = math.min(current_h4_open * (1 + manip_mean / 100), current_h4_open * (1 + manip_median / 100))
+
+var int last_bull_band_tap_time = na
+var int last_bear_band_tap_time = na
+if zone_bands_valid
+    if high >= bull_band_bottom and low <= bull_band_top
+        last_bull_band_tap_time := time
+    if high >= bear_band_bottom and low <= bear_band_top
+        last_bear_band_tap_time := time
+
+f_bull_mark_allowed(_start_price, _end_price) =>
+    result = true
+    if display_filter_mode == "Side of 4H open" or (display_filter_mode == "Zone contact" and not zone_bands_valid)
+        result := _end_price < current_h4_open
+    else if display_filter_mode == "Zone contact"
+        leg_in_band = (_start_price >= bull_band_bottom and _start_price <= bull_band_top) or (_end_price >= bull_band_bottom and _end_price <= bull_band_top)
+        recently_tapped = not na(last_bull_band_tap_time) and time - last_bull_band_tap_time <= zone_tap_recency_minutes * 60 * 1000
+        result := leg_in_band or recently_tapped
+    result
+
+f_bear_mark_allowed(_start_price, _end_price) =>
+    result = true
+    if display_filter_mode == "Side of 4H open" or (display_filter_mode == "Zone contact" and not zone_bands_valid)
+        result := _end_price > current_h4_open
+    else if display_filter_mode == "Zone contact"
+        leg_in_band = (_start_price >= bear_band_bottom and _start_price <= bear_band_top) or (_end_price >= bear_band_bottom and _end_price <= bear_band_top)
+        recently_tapped = not na(last_bear_band_tap_time) and time - last_bear_band_tap_time <= zone_tap_recency_minutes * 60 * 1000
+        result := leg_in_band or recently_tapped
+    result
+
+// ── Zone band highlight ──────────────────────────────────────────────────────
+
+// The same calibrated bands the mark filter uses, made visible.
+f_draw_zone_band(_valid, _top, _bottom, _band_color) =>
+    var box band = na
+    if _valid and na(band)
+        band := box.new(bar_index, _top, bar_index + 2, _bottom, xloc = xloc.bar_index, extend = extend.right, border_color = _band_color, bgcolor = color.new(_band_color, 85))
+    if _valid and not na(band)
+        box.set_lefttop(band, bar_index, _top)
+        box.set_rightbottom(band, bar_index + 2, _bottom)
+    if not _valid and not na(band)
+        box.delete(band)
+        band := na
+
+f_draw_zone_band(show_zone_bands and zone_bands_valid, bull_band_top, bull_band_bottom, color.green)
+f_draw_zone_band(show_zone_bands and zone_bands_valid, bear_band_top, bear_band_bottom, color.red)
+
+// ── Payload construction ─────────────────────────────────────────────────────
+
+f_price_string(_price) =>
+    str.tostring(_price, format.mintick)
+
+f_timeframe_token() =>
+    str.tostring(math.round(timeframe.in_seconds() / 60)) + " min(s)"
+
+f_duration_text(_start_time, _end_time) =>
+    total_minutes = math.max(0, int((_end_time - _start_time) / 60000))
+    hours = int(total_minutes / 60)
+    minutes = total_minutes % 60
+    hours > 0 ? str.tostring(hours) + "h " + str.tostring(minutes) + "m" : str.tostring(minutes) + "m"
+
+// Always full date-time (the vendor's same-day date-dropping quirk is
+// deliberately not replicated).
+f_time_string(_t) =>
+    str.format_time(_t, "yyyy-MM-dd HH:mm:ss", "America/New_York")
+
+f_formation_payload(_pair, _bullish, _tf_token, _start_price, _start_time, _end_price, _end_time) =>
+    '{"indicator":"SMT","event":"formed","source":"printer"' +
+     ',"pair":"' + _pair + '"' +
+     ',"type":"' + (_bullish ? "Bullish" : "Bearish") + '"' +
+     ',"timeframe":"' + _tf_token + '"' +
+     ',"start_price":"' + f_price_string(_start_price) + '"' +
+     ',"start_time":"' + f_time_string(_start_time) + '"' +
+     ',"end_price":"' + f_price_string(_end_price) + '"' +
+     ',"end_time":"' + f_time_string(_end_time) + '"' +
+     ',"duration":"' + f_duration_text(_start_time, _end_time) + '"' +
+     ',"fvg":""}'
+
+f_breakage_payload(_pair, _bullish, _tf_token, _start_time) =>
+    '{"indicator":"SMT","event":"broken","source":"printer"' +
+     ',"pair":"' + _pair + '"' +
+     ',"type":"' + (_bullish ? "Bullish" : "Bearish") + '"' +
+     ',"timeframe":"' + _tf_token + '"' +
+     ',"smt_time":"' + f_time_string(_start_time) + '"}'
+
+// ── SMT state ────────────────────────────────────────────────────────────────
+
+type ActiveSmt
+    string pair_name
+    string tf_token
+    bool  is_bullish
+    float start_price
+    int   start_time
+    float end_price
+    int   end_time
+
+var array<ActiveSmt> active_smts = array.new<ActiveSmt>()
+
+// ── Detection core: consecutive swings, window-extreme comparison ────────────
+
+// LuxAlgo's swing anatomy (fractal pivots, sign-product divergence test) with
+// its pairing filter REPLACED (2026-07-05): the same-bar sync requirement and
+// re-anchor rule silently discarded real divergences whenever the two
+// symbols' pivots confirmed out of step. Here EVERY consecutive chart swing
+// pair is tested; the comparison side is its window extreme around each
+// swing bar — no comparison-pivot confirmation required, zero discards.
+
+// Evaluation waits until the comparison window is fully formed on both
+// sides of the swing.
+evaluation_offset = math.max(pivot_length, comparison_window)
+pivot_shift = evaluation_offset - pivot_length
+
+// Chart swings, re-timed so a non-na value means "a swing sits exactly
+// evaluation_offset bars back".
+swing_high_now = ta.pivothigh(pivot_length, pivot_length)[pivot_shift]
+swing_low_now  = ta.pivotlow(pivot_length, pivot_length)[pivot_shift]
+
+// Comparison extreme within ±comparison_window bars of the swing bar.
+// Offsets stay >= 0 because evaluation_offset >= comparison_window.
+f_window_extreme(_series, _find_max) =>
+    extreme = _series[evaluation_offset]
+    if comparison_window > 0
+        for k = 1 to comparison_window
+            older = _series[evaluation_offset + k]
+            newer = _series[evaluation_offset - k]
+            extreme := _find_max ? math.max(extreme, math.max(older, newer)) : math.min(extreme, math.min(older, newer))
+    extreme
+
+comparison_1_window_high = f_window_extreme(comparison_1_high, true)
+comparison_1_window_low  = f_window_extreme(comparison_1_low, false)
+comparison_2_window_high = f_window_extreme(comparison_2_high, true)
+comparison_2_window_low  = f_window_extreme(comparison_2_low, false)
+
+// Consecutive-swing divergence, per (comparison symbol × side). State lives
+// per call site. Called UNCONDITIONALLY every bar (Pine CW10003).
+// WHY break-disagreement instead of LuxAlgo's sign product (trader ruling
+// 2026-07-05): an EQUAL high/low is a FAILURE to break — one symbol breaking
+// its swing while the other merely equals it IS a divergence. The sign
+// product scores equals as zero and misses those; the boolean test keeps
+// everything the sign product caught and adds the equal-vs-break cases.
+f_smt_divergence(_is_high_side, _swing_price_now, _comparison_extreme_now) =>
+    var float previous_swing = na
+    var int   previous_swing_time = na
+    var float previous_comparison = na
+    formed = false
+    start_price = float(na)
+    start_time = int(na)
+    end_price = float(na)
+    end_time = int(na)
+    if not na(_swing_price_now) and barstate.isconfirmed and not na(_comparison_extreme_now)
+        if not na(previous_swing) and not na(previous_comparison)
+            chart_broke = _is_high_side ? _swing_price_now > previous_swing : _swing_price_now < previous_swing
+            comparison_broke = _is_high_side ? _comparison_extreme_now > previous_comparison : _comparison_extreme_now < previous_comparison
+            if chart_broke != comparison_broke
+                formed := true
+                start_price := previous_swing
+                start_time := previous_swing_time
+                end_price := _swing_price_now
+                end_time := time[evaluation_offset]
+        previous_swing := _swing_price_now
+        previous_swing_time := time[evaluation_offset]
+        previous_comparison := _comparison_extreme_now
+    [formed, start_price, start_time, end_price, end_time]
+
+// High-side divergence = bearish; low-side = bullish (our strategy naming).
+[bear_1_formed, bear_1_start, bear_1_start_t, bear_1_end, bear_1_end_t] = f_smt_divergence(true,  swing_high_now, comparison_1_window_high)
+[bull_1_formed, bull_1_start, bull_1_start_t, bull_1_end, bull_1_end_t] = f_smt_divergence(false, swing_low_now,  comparison_1_window_low)
+[bear_2_formed, bear_2_start, bear_2_start_t, bear_2_end, bear_2_end_t] = f_smt_divergence(true,  swing_high_now, comparison_2_window_high)
+[bull_2_formed, bull_2_start, bull_2_start_t, bull_2_end, bull_2_end_t] = f_smt_divergence(false, swing_low_now,  comparison_2_window_low)
+
+// Emission — once per confirmed bar; alerts unfiltered, marks zone-filtered.
+f_emit(_enabled, _pair, _bullish, _formed, _start_price, _start_time, _end_price, _end_time) =>
+    if _enabled and _formed and barstate.isconfirmed
+        array.push(active_smts, ActiveSmt.new(_pair, f_timeframe_token(), _bullish, _start_price, _start_time, _end_price, _end_time))
+        if fire_formation_alerts
+            alert(f_formation_payload(_pair, _bullish, f_timeframe_token(), _start_price, _start_time, _end_price, _end_time), alert.freq_once_per_bar_close)
+        mark_allowed = _bullish ? f_bull_mark_allowed(_start_price, _end_price) : f_bear_mark_allowed(_start_price, _end_price)
+        if show_marks and mark_allowed
+            mark_color = _bullish ? color.green : color.red
+            line.new(_start_time, _start_price, _end_time, _end_price, xloc = xloc.bar_time, color = mark_color, width = 1)
+            label.new(_end_time, _end_price, "SMT-P", xloc = xloc.bar_time, style = _bullish ? label.style_label_up : label.style_label_down, color = color.new(mark_color, 20), textcolor = color.white, size = size.tiny)
+
+f_emit(use_comparison_1, pair_label_1, false, bear_1_formed, bear_1_start, bear_1_start_t, bear_1_end, bear_1_end_t)
+f_emit(use_comparison_1, pair_label_1, true,  bull_1_formed, bull_1_start, bull_1_start_t, bull_1_end, bull_1_end_t)
+f_emit(use_comparison_2, pair_label_2, false, bear_2_formed, bear_2_start, bear_2_start_t, bear_2_end, bear_2_end_t)
+f_emit(use_comparison_2, pair_label_2, true,  bull_2_formed, bull_2_start, bull_2_start_t, bull_2_end, bull_2_end_t)
+
+// ── Higher-timeframe SMT layers ──────────────────────────────────────────────
+
+// Chart-side pairing of held HTF swings: when the chart symbol's held swing
+// steps (a new confirmed HTF pivot), it is judged against the comparison
+// symbol's LATEST held swing — no confirmation-sync requirement. Break-
+// disagreement semantics identical to the chart-TF core. State per call site;
+// called unconditionally every bar (Pine CW10003).
+f_htf_divergence(_is_high_side, _held_price, _held_time, _comparison_held) =>
+    var float previous_swing = na
+    var int   previous_swing_time = na
+    var float previous_comparison = na
+    formed = false
+    start_price = float(na)
+    start_time = int(na)
+    end_price = float(na)
+    end_time = int(na)
+    stepped = _held_price != _held_price[1] or _held_time != _held_time[1]
+    if stepped and barstate.isconfirmed and not na(_held_price) and not na(_comparison_held)
+        if not na(previous_swing) and not na(previous_comparison)
+            chart_broke = _is_high_side ? _held_price > previous_swing : _held_price < previous_swing
+            comparison_broke = _is_high_side ? _comparison_held > previous_comparison : _comparison_held < previous_comparison
+            if chart_broke != comparison_broke
+                formed := true
+                start_price := previous_swing
+                start_time := previous_swing_time
+                end_price := _held_price
+                end_time := _held_time
+        previous_swing := _held_price
+        previous_swing_time := _held_time
+        previous_comparison := _comparison_held
+    [formed, start_price, start_time, end_price, end_time]
+
+// HTF marks are ALWAYS shown (trader ruling: standing structure) — no zone
+// filter. Heavier lines + timeframe-tagged labels distinguish the layers.
+f_emit_htf(_enabled, _pair, _bullish, _tf_minutes, _tf_label, _formed, _start_price, _start_time, _end_price, _end_time) =>
+    if _enabled and _formed and barstate.isconfirmed
+        tf_token = str.tostring(_tf_minutes) + " min(s)"
+        array.push(active_smts, ActiveSmt.new(_pair, tf_token, _bullish, _start_price, _start_time, _end_price, _end_time))
+        if fire_formation_alerts
+            alert(f_formation_payload(_pair, _bullish, tf_token, _start_price, _start_time, _end_price, _end_time), alert.freq_once_per_bar_close)
+        if show_marks
+            mark_color = _bullish ? color.green : color.red
+            line.new(_start_time, _start_price, _end_time, _end_price, xloc = xloc.bar_time, color = mark_color, width = 2)
+            label.new(_end_time, _end_price, "SMT-P " + _tf_label, xloc = xloc.bar_time, style = _bullish ? label.style_label_up : label.style_label_down, color = color.new(mark_color, 10), textcolor = color.white, size = size.small)
+
+[m15_bear_1_f, m15_bear_1_s, m15_bear_1_st, m15_bear_1_e, m15_bear_1_et] = f_htf_divergence(true,  m15_chart_high, m15_chart_high_t, m15_comp1_high)
+[m15_bull_1_f, m15_bull_1_s, m15_bull_1_st, m15_bull_1_e, m15_bull_1_et] = f_htf_divergence(false, m15_chart_low,  m15_chart_low_t,  m15_comp1_low)
+[m15_bear_2_f, m15_bear_2_s, m15_bear_2_st, m15_bear_2_e, m15_bear_2_et] = f_htf_divergence(true,  m15_chart_high, m15_chart_high_t, m15_comp2_high)
+[m15_bull_2_f, m15_bull_2_s, m15_bull_2_st, m15_bull_2_e, m15_bull_2_et] = f_htf_divergence(false, m15_chart_low,  m15_chart_low_t,  m15_comp2_low)
+[h4_bear_1_f, h4_bear_1_s, h4_bear_1_st, h4_bear_1_e, h4_bear_1_et] = f_htf_divergence(true,  h4_chart_high, h4_chart_high_t, h4_comp1_high)
+[h4_bull_1_f, h4_bull_1_s, h4_bull_1_st, h4_bull_1_e, h4_bull_1_et] = f_htf_divergence(false, h4_chart_low,  h4_chart_low_t,  h4_comp1_low)
+[h4_bear_2_f, h4_bear_2_s, h4_bear_2_st, h4_bear_2_e, h4_bear_2_et] = f_htf_divergence(true,  h4_chart_high, h4_chart_high_t, h4_comp2_high)
+[h4_bull_2_f, h4_bull_2_s, h4_bull_2_st, h4_bull_2_e, h4_bull_2_et] = f_htf_divergence(false, h4_chart_low,  h4_chart_low_t,  h4_comp2_low)
+
+f_emit_htf(run_15m_layer and use_comparison_1, pair_label_1, false, 15, "15m", m15_bear_1_f, m15_bear_1_s, m15_bear_1_st, m15_bear_1_e, m15_bear_1_et)
+f_emit_htf(run_15m_layer and use_comparison_1, pair_label_1, true,  15, "15m", m15_bull_1_f, m15_bull_1_s, m15_bull_1_st, m15_bull_1_e, m15_bull_1_et)
+f_emit_htf(run_15m_layer and use_comparison_2, pair_label_2, false, 15, "15m", m15_bear_2_f, m15_bear_2_s, m15_bear_2_st, m15_bear_2_e, m15_bear_2_et)
+f_emit_htf(run_15m_layer and use_comparison_2, pair_label_2, true,  15, "15m", m15_bull_2_f, m15_bull_2_s, m15_bull_2_st, m15_bull_2_e, m15_bull_2_et)
+f_emit_htf(run_h4_layer and use_comparison_1, pair_label_1, false, 240, "4H", h4_bear_1_f, h4_bear_1_s, h4_bear_1_st, h4_bear_1_e, h4_bear_1_et)
+f_emit_htf(run_h4_layer and use_comparison_1, pair_label_1, true,  240, "4H", h4_bull_1_f, h4_bull_1_s, h4_bull_1_st, h4_bull_1_e, h4_bull_1_et)
+f_emit_htf(run_h4_layer and use_comparison_2, pair_label_2, false, 240, "4H", h4_bear_2_f, h4_bear_2_s, h4_bear_2_st, h4_bear_2_e, h4_bear_2_et)
+f_emit_htf(run_h4_layer and use_comparison_2, pair_label_2, true,  240, "4H", h4_bull_2_f, h4_bull_2_s, h4_bull_2_st, h4_bull_2_e, h4_bull_2_et)
+
+// ── Breakage detection ───────────────────────────────────────────────────────
+
+// An SMT breaks when price trades beyond the EXTREME of its two swings — the
+// strategy's stop level, so a break IS the invalidation event
+// (docs/decisions.md). Iterated backwards so removals don't skip elements.
+if barstate.isconfirmed and array.size(active_smts) > 0
+    for i = array.size(active_smts) - 1 to 0
+        smt = array.get(active_smts, i)
+        breakage_level = smt.is_bullish ? math.min(smt.start_price, smt.end_price) : math.max(smt.start_price, smt.end_price)
+        smt_is_broken = smt.is_bullish ? low < breakage_level : high > breakage_level
+        if smt_is_broken
+            if fire_breakage_alerts
+                alert(f_breakage_payload(smt.pair_name, smt.is_bullish, smt.tf_token, smt.start_time), alert.freq_once_per_bar_close)
+            array.remove(active_smts, i)
+    // Memory guard only — server-side staleness belongs to the (UNDECIDED)
+    // SMT validity window parameter.
+    while array.size(active_smts) > 500
+        array.remove(active_smts, 0)

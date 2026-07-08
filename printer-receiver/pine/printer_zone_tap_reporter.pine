@@ -1,0 +1,182 @@
+//@version=6
+// DEPRECATED 2026-07-04 — never deployed. Manual per-4H transcription was
+// rejected by the trader; replaced by printer_zone_publisher.pine (computed
+// zones, 4H chart) + printer_bar_reporter.pine (1m heartbeat) with tap
+// detection moving server-side. Kept as reference for the band-tap logic.
+indicator("Printer — Zone Tap Reporter", overlay = true)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WHY THIS EXISTS
+// Statmap's own alerts carry no prices and no symbol (captured fact — see
+// docs/payloads.md), so the server can never learn zone geometry or detect
+// zone taps from Statmap alone. The trader transcribes Statmap's zone BANDS
+// into the inputs below. This indicator then:
+//   1. draws the bands on the chart so the transcription can be visually
+//      verified against Statmap's boxes, and
+//   2. fires a single-line JSON webhook alert whenever price ENTERS a band,
+//      carrying the FULL zone table so the server always has the geometry it
+//      needs to pre-stage stop / TP1 / TP2.
+//
+// Hard rules honored here (see printer-receiver/CLAUDE.md):
+//   - Alerts fire once per bar close only. No intrabar signals.
+//   - All timestamps anchored to New York time.
+//   - Every condition carries a plain-English WHY comment.
+//
+// OPERATING NOTE: TradingView freezes indicator inputs into an alert at the
+// moment the alert is created (captured fact). After editing ANY input,
+// DELETE AND RE-CREATE this indicator's alert or it will keep firing with
+// the old zone levels. Statmap zones refresh every 4H candle, so this
+// transcribe-and-recreate routine runs once per 4H candle.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Zone naming follows Statmap's own [+] / [-] vocabulary so transcription is
+// unambiguous: [+] zones sit above price, [-] zones below.
+group_plus_manipulation  = "[+] Manipulation zone (upper)"
+group_minus_manipulation = "[-] Manipulation zone (lower)"
+group_plus_distribution  = "[+] Distribution zone (upper)"
+group_minus_distribution = "[-] Distribution zone (lower)"
+
+// Each zone is a BAND — "the mean and median and everything in between"
+// (trader ruling) — so it is transcribed as a high and a low, not one line.
+// The enabled toggle exists because not all four zones are always on the
+// chart; a disabled zone never fires and is marked disabled in the payload.
+plus_manipulation_enabled  = input.bool(false,  "Enabled",   group = group_plus_manipulation)
+plus_manipulation_high     = input.price(0.0,   "Band high", group = group_plus_manipulation)
+plus_manipulation_low      = input.price(0.0,   "Band low",  group = group_plus_manipulation)
+
+minus_manipulation_enabled = input.bool(false,  "Enabled",   group = group_minus_manipulation)
+minus_manipulation_high    = input.price(0.0,   "Band high", group = group_minus_manipulation)
+minus_manipulation_low     = input.price(0.0,   "Band low",  group = group_minus_manipulation)
+
+plus_distribution_enabled  = input.bool(false,  "Enabled",   group = group_plus_distribution)
+plus_distribution_high     = input.price(0.0,   "Band high", group = group_plus_distribution)
+plus_distribution_low      = input.price(0.0,   "Band low",  group = group_plus_distribution)
+
+minus_distribution_enabled = input.bool(false,  "Enabled",   group = group_minus_distribution)
+minus_distribution_high    = input.price(0.0,   "Band high", group = group_minus_distribution)
+minus_distribution_low     = input.price(0.0,   "Band low",  group = group_minus_distribution)
+
+// ── Tap detection ────────────────────────────────────────────────────────────
+
+// WHY these exist: the trader re-types 8 price fields every 4H candle, so a
+// swapped high/low WILL eventually happen. Unnormalized, a swap silently turns
+// the tap test from "bar overlaps band" into "bar engulfs the whole band" and
+// ships inverted geometry to the server — in a money-touching pipeline, that
+// guardrail must live in code, not in operator care.
+f_band_top(_band_high, _band_low) =>
+    math.max(_band_high, _band_low)
+f_band_bottom(_band_high, _band_low) =>
+    math.min(_band_high, _band_low)
+
+// A zone is "tagged" when the bar's range overlaps the band — a wick touch
+// counts even if the bar closes outside (trader ruling: any touch qualifies
+// to start the SMT search / validate a present SMT).
+f_bar_touches_band(_band_high, _band_low) =>
+    high >= f_band_bottom(_band_high, _band_low) and low <= f_band_top(_band_high, _band_low)
+
+plus_manipulation_touched  = plus_manipulation_enabled  and f_bar_touches_band(plus_manipulation_high,  plus_manipulation_low)
+minus_manipulation_touched = minus_manipulation_enabled and f_bar_touches_band(minus_manipulation_high, minus_manipulation_low)
+plus_distribution_touched  = plus_distribution_enabled  and f_bar_touches_band(plus_distribution_high,  plus_distribution_low)
+minus_distribution_touched = minus_distribution_enabled and f_bar_touches_band(minus_distribution_high, minus_distribution_low)
+
+// WHY: the alert is deleted and re-created every 4H candle (zones refresh).
+// If price is ALREADY inside a band when the new alert goes live, the fresh
+// entry happened on a historical bar where no webhook fires — without this,
+// the server would never hear the tap (or this cycle's geometry) until price
+// left and re-entered. So the first realtime bar close also reports any
+// in-progress stay, once. Server-side idempotency absorbs any duplicate.
+first_realtime_bar = barstate.isrealtime and not barstate.isrealtime[1]
+
+// Fire only on the FIRST bar of each stay inside a band. Price leaving the
+// band and returning later fires again (trader delegated the re-fire rule;
+// firing every fresh entry keeps the indicator dumb and puts ALL validity
+// window logic in one place — the server).
+plus_manipulation_entered  = plus_manipulation_touched  and (not plus_manipulation_touched[1]  or first_realtime_bar)
+minus_manipulation_entered = minus_manipulation_touched and (not minus_manipulation_touched[1] or first_realtime_bar)
+plus_distribution_entered  = plus_distribution_touched  and (not plus_distribution_touched[1]  or first_realtime_bar)
+minus_distribution_entered = minus_distribution_touched and (not minus_distribution_touched[1] or first_realtime_bar)
+
+// ── JSON payload construction ────────────────────────────────────────────────
+
+// Prices are serialized tick-accurately as strings; the server parses them.
+// Strings, not bare numbers, so a formatting surprise can never invalidate
+// the JSON (lesson from the SMT template work — see docs/payloads.md).
+f_price_string(_price) =>
+    str.tostring(_price, format.mintick)
+
+// Serialized through the same normalization so the server can NEVER receive
+// a zone whose high is below its low, even from a swapped transcription.
+f_zone_object(_enabled, _band_high, _band_low) =>
+    '{"enabled":' + (_enabled ? "true" : "false") +
+     ',"high":"' + f_price_string(f_band_top(_band_high, _band_low)) +
+     '","low":"' + f_price_string(f_band_bottom(_band_high, _band_low)) + '"}'
+
+// Every tap alert carries the FULL zone table, because a tap is step 1 of the
+// setup sequence: the server learns complete geometry before it could ever
+// need to arm, so stop/TP1/TP2 are always computable from webhooks alone.
+f_zones_table_json() =>
+    '"zones":{' +
+     '"plus_manipulation":'  + f_zone_object(plus_manipulation_enabled,  plus_manipulation_high,  plus_manipulation_low)  + ',' +
+     '"minus_manipulation":' + f_zone_object(minus_manipulation_enabled, minus_manipulation_high, minus_manipulation_low) + ',' +
+     '"plus_distribution":'  + f_zone_object(plus_distribution_enabled,  plus_distribution_high,  plus_distribution_low)  + ',' +
+     '"minus_distribution":' + f_zone_object(minus_distribution_enabled, minus_distribution_high, minus_distribution_low) + '}'
+
+// chart_timeframe is included so the server can whitelist the production
+// detection chart and reject taps fired from any other timeframe (same
+// pattern as whitelisting Statmap's "4H" token).
+// bar_close_time_ny is New York time per the project-wide anchor rule.
+f_fire_tap_alert(_zone_name) =>
+    payload = '{"indicator":"ZONES","event":"tap"' +
+     ',"zone":"' + _zone_name + '"' +
+     ',"symbol":"' + syminfo.ticker + '"' +
+     ',"chart_timeframe":"' + timeframe.period + '"' +
+     ',"bar_high":"' + f_price_string(high) + '"' +
+     ',"bar_low":"' + f_price_string(low) + '"' +
+     ',"bar_close":"' + f_price_string(close) + '"' +
+     ',"bar_close_time_ny":"' + str.format_time(time_close, "yyyy-MM-dd HH:mm:ss", "America/New_York") + '"' +
+     ',' + f_zones_table_json() + '}'
+    // Once per bar close — the project-wide alert cadence hard rule.
+    alert(payload, alert.freq_once_per_bar_close)
+
+if plus_manipulation_entered
+    f_fire_tap_alert("plus_manipulation")
+if minus_manipulation_entered
+    f_fire_tap_alert("minus_manipulation")
+if plus_distribution_entered
+    f_fire_tap_alert("plus_distribution")
+if minus_distribution_entered
+    f_fire_tap_alert("minus_distribution")
+
+// ── Visual verification bands ────────────────────────────────────────────────
+
+// The bands are drawn so the trader can see EXACTLY what the server will be
+// told and eyeball it against Statmap's boxes before re-creating the alert.
+// A mistyped level is visible immediately instead of silently corrupting
+// every downstream decision.
+// WHY the fuchsia flag: a box renders identically whether top/bottom are
+// swapped or not, so a swapped transcription is INVISIBLE without an explicit
+// signal. A fuchsia band means "your high/low inputs are reversed — fix them
+// before re-creating the alert." (Detection and the payload are already
+// normalized, so a swap is not dangerous — just loud, so it gets corrected.)
+f_draw_band(_enabled, _band_high, _band_low, _band_color) =>
+    swapped = _band_high < _band_low
+    draw_color = swapped ? color.fuchsia : _band_color
+    var box band = na
+    // Flat guarded blocks instead of if/else: Pine requires both branches of
+    // an if/else to return the same type (CE10235), and these blocks mix
+    // void drawing calls with a box reassignment.
+    if _enabled and na(band)
+        band := box.new(bar_index, f_band_top(_band_high, _band_low), bar_index + 1, f_band_bottom(_band_high, _band_low), xloc = xloc.bar_index, extend = extend.both, border_color = draw_color, bgcolor = color.new(draw_color, 85))
+    if _enabled and not na(band)
+        box.set_top(band, f_band_top(_band_high, _band_low))
+        box.set_bottom(band, f_band_bottom(_band_high, _band_low))
+        box.set_border_color(band, draw_color)
+        box.set_bgcolor(band, color.new(draw_color, 85))
+    if not _enabled and not na(band)
+        box.delete(band)
+        band := na
+
+f_draw_band(plus_manipulation_enabled,  plus_manipulation_high,  plus_manipulation_low,  color.red)
+f_draw_band(minus_manipulation_enabled, minus_manipulation_high, minus_manipulation_low, color.green)
+f_draw_band(plus_distribution_enabled,  plus_distribution_high,  plus_distribution_low,  color.orange)
+f_draw_band(minus_distribution_enabled, minus_distribution_high, minus_distribution_low, color.teal)

@@ -1,0 +1,37 @@
+//@version=6
+indicator("Printer — Bar Reporter", overlay = true)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WHY THIS EXISTS
+// The server has no price feed by design — it only knows what webhooks tell
+// it. Zone geometry arrives from "Printer — StatMap Zone Publisher" (4H
+// chart), but detecting when price TAPS a zone needs bar-by-bar prices. This
+// heartbeat supplies them: one JSON webhook per 1-minute bar close, carrying
+// the bar's OHLC. The server does the tap detection itself — in testable
+// Python, not Pine.
+//
+// It doubles as the server's wall clock: validity windows and expiries can
+// tick off received bars instead of trusting local time.
+//
+// RUN THIS ON THE NQ1! CONTINUOUS 1-MINUTE CHART — the same symbol the Zone
+// Publisher computes from, so tap comparisons are apples to apples.
+//
+// It has NO inputs, so the alert is created once and NEVER needs re-creating.
+// Fires once per bar close — the project's standard alert cadence.
+// ─────────────────────────────────────────────────────────────────────────────
+
+f_price_string(_price) =>
+    str.tostring(_price, format.mintick)
+
+bar_payload = '{"indicator":"BARS","event":"bar_close"' +
+     ',"symbol":"' + syminfo.ticker + '"' +
+     ',"chart_timeframe":"' + timeframe.period + '"' +
+     ',"open":"' + f_price_string(open) + '"' +
+     ',"high":"' + f_price_string(high) + '"' +
+     ',"low":"' + f_price_string(low) + '"' +
+     ',"close":"' + f_price_string(close) + '"' +
+     ',"bar_close_time_ny":"' + str.format_time(time_close, "yyyy-MM-dd HH:mm:ss", "America/New_York") + '"}'
+
+// Unconditional call: the once-per-bar-close frequency makes this fire exactly
+// once per completed realtime bar and never on historical bars.
+alert(bar_payload, alert.freq_once_per_bar_close)

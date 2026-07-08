@@ -1,0 +1,610 @@
+//@version=6
+// No scale override: a plain overlay inherits the SYMBOL'S price scale on a
+// fresh add, which is the only binding that stretches with the candles.
+// (Forcing scale.right created a second, separate scale — observed live.)
+// If drawings ever detach again: indicator ⋯ menu → Pin to scale → same as symbol.
+indicator("Printer — StatMap Zone Publisher", overlay = true, max_boxes_count = 100)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WHY THIS EXISTS
+// Statmap (OHLC Statistical Mapping [Pro+]) is closed source, its alerts carry
+// no prices, and its levels are drawing objects invisible to TradingView's
+// alert placeholders. Manual transcription was rejected by the trader
+// (docs/decisions.md, 2026-07-04). So this indicator reimplements the same
+// public statistical concept and PUBLISHES the zone geometry to the server:
+// for the current 4H candle it projects the historical average and median
+// manipulation / distribution sizes from the candle open, in percent — the
+// same configuration as the trader's Statmap (Lookback 60, Both, Percent,
+// continuous contract data).
+//
+// Manipulation = the wick opposing the candle's close (public ICT definition,
+// straight from the vendor's own description). Distribution = the expansion
+// in the close's direction. The zone BAND = between the mean and the median
+// projection ("the mean and median and everything in between" — trader ruling).
+//
+// RUN THIS ON THE NQ1! CONTINUOUS 4H CHART: it needs years of 4H history for
+// 60 samples per candle slot, and continuous-contract data mirrors Statmap's
+// "Use Continuous Contracts" setting.
+//
+// It fires ONE webhook per 4H candle, at the candle OPEN (not close): the
+// levels are fully determined at the open, and the server must hold the
+// geometry BEFORE the candle trades. This is a deliberate, documented
+// exception to the once-per-bar-CLOSE rule — the payload is a deterministic
+// scheduled broadcast, not a market signal (see docs/payloads.md).
+//
+// Tap detection does NOT live here — the server performs it against the
+// 1-minute heartbeat from "Printer — Bar Reporter" (see docs/architecture.md).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The indicator runs in two modes:
+//   HOST (4H chart): computes from native bars — the calibrated reference
+//   path, and the ONLY instance allowed to fire webhooks.
+//   VIEWER (any chart < 4H): rebuilds the same 4H statistics via
+//   request.security so the trader sees the server's zones while trading
+//   lower timeframes. View-only — never alerts.
+// Charts above 4H are refused: the stats are meaningless there.
+is_host_4h = timeframe.period == "240"
+if timeframe.in_seconds() > timeframe.in_seconds("240")
+    runtime.error("Printer — StatMap Zone Publisher runs on 4H or lower charts only")
+if not chart.is_standard
+    runtime.error("Printer — StatMap Zone Publisher requires a standard candle chart")
+// NOTE for 15-second charts: TradingView loads too little history there to
+// fill a 60-candle 4H window — the table will show low n and bands stay
+// hidden until enough history exists (use 1m or higher to view zones).
+
+// ── Configuration ────────────────────────────────────────────────────────────
+// The calc group mirrors Statmap's settings so both tools compute the same
+// thing; the hypothesis group exists ONLY for the calibration loop — flip
+// toggles until our lines sit 1:1 on Statmap's, then never touch again.
+// NOTE: changing ANY input requires deleting and re-creating the alert
+// (TradingView freezes inputs at alert creation). That is acceptable here
+// because these are set-once calibration constants, not per-candle data.
+group_calc = "Calculation (mirrors Statmap — set once)"
+group_hypothesis = "Calibration hypothesis toggles"
+group_display = "Display / alerts"
+
+lookback_samples    = input.int(60, "Calculation lookback (samples)", minval = 5, group = group_calc)
+minimum_samples     = input.int(10, "Minimum samples for a zone to be valid", minval = 2, group = group_calc)
+use_percent_mode    = input.bool(true, "Percent mode (Statmap: Percent; off = points)", group = group_calc)
+// Default ON — PROVEN 2026-07-05 from Statmap's historical tooltips: adjacent
+// candles carry 2.5x different stats (22:00 slot manip 0.107% vs 10:00 slot
+// 0.263%), impossible under any pooled rolling window. Statmap samples 60
+// occurrences of the SAME clock-time candle (60 trading days), exactly the
+// "specific candles" its description advertises. The earlier pooled reading
+// matched the calibration candle coincidentally.
+use_per_slot_stats  = input.bool(true, "Per-slot stats: only candles at the same 4H clock time", group = group_hypothesis)
+// Default OFF — calibration PROVEN 2026-07-04 from Statmap's own tooltips:
+// all four levels are perfectly symmetric around the open (midpoints equal
+// 29940.0 exactly on the reference candle), so stats are pooled, not
+// direction-conditional. (An earlier asymmetric reading was an artifact of
+// the separate-price-scale rendering bug.)
+use_direction_split = input.bool(false, "Direction-conditional stats (bull/bear measured separately)", group = group_hypothesis)
+// WHY window-then-split: the trader defines the lookback as "the past 60 4H
+// candles" — ONE shared window. Direction conditioning selects WITHIN those
+// 60 candles (≈30 bulls / ≈30 bears); it does not reach further back to fill
+// 60 samples per direction. Toggle off to restore fill-per-direction.
+use_window_then_split = input.bool(true, "Direction split WITHIN the 60-candle window (vs 60 per direction)", group = group_hypothesis)
+// Default OFF — CALIBRATED 2026-07-04: holiday-shortened candles are part of
+// Statmap's sample (excluding them worsened the match).
+skip_irregular_bars = input.bool(false, "Exclude holiday-shortened candles from the sample", group = group_hypothesis)
+// Default OFF — CALIBRATED 2026-07-04: including dojis moved the stats away
+// from Statmap's, so dojis are excluded (no "wick opposing the close" exists).
+include_doji_candles = input.bool(false, "Include doji candles (counted as bullish)", group = group_hypothesis)
+// Default OFF — 2026-07-05: under the proven PER-SLOT windows, distribution
+// is plain EXPANSION-FROM-OPEN (verified against historical tooltips on two
+// slots). The 2026-07-04 full-range finding was an artifact of pooled
+// windowing compensating for the wrong sample shape.
+use_full_range_distribution = input.bool(false, "Distribution = full candle range (vs expansion from open)", group = group_hypothesis)
+// Default OFF — 2026-07-05: like full-range, the sequence trim was a pooled-
+// era compensation. Per-slot expansion-from-open needs no trim. The
+// machinery survives as a calibration fallback only.
+use_sequence_aware_distribution = input.bool(false, "Distribution = post-manipulation travel (sequence-aware)", group = group_hypothesis)
+// WHY: for late-manipulation candles the post-manipulation travel can be
+// measured to the candle CLOSE (off) or to the post-manipulation EXTREME
+// (on). Extreme-based is always >= close-based, so it pushes the
+// distribution stat outward — a calibration discriminator for the last
+// median residual.
+use_post_manip_extreme = input.bool(false, "Post-manip travel measured to post-manip extreme (vs close)", group = group_hypothesis)
+// Default OFF — 2026-07-05: under per-slot windows the STANDARD middle-pair
+// median (array.median) matches Statmap 1:1 across the historical trail
+// (trader-verified). The lower-middle variant was the final pooled-era
+// compensation; kept as a calibration fallback only.
+use_lower_middle_median = input.bool(false, "Median = lower-middle element (vs average of middle pair)", group = group_hypothesis)
+// WHY: Statmap draws its levels per SESSION, so its 60-candle window may be
+// anchored at the session start instead of rolling forward every candle.
+// Offset N drops the N most recent completed candles from my window to test
+// that alignment during calibration.
+window_offset_candles = input.int(0, "Window offset (skip N most recent candles)", minval = 0, maxval = 12, group = group_hypothesis)
+fire_level_alerts   = input.bool(true, "Fire zone-levels webhook at each 4H open", group = group_display)
+show_table          = input.bool(true, "Show calibration table", group = group_display)
+// Historical bands: dimmed, candle-scoped snapshots of the zones as they
+// were AT each past candle's open (look-ahead-free — exactly what the alert
+// broadcast then). Scoped to their own candle, never extended right.
+historical_bands_to_keep = input.int(3, "Historical candles to show bands for", minval = 0, maxval = 10, group = group_display)
+// WHY: exports the raw per-candle sample window through the webhook so the
+// exact statistic rule can be solved offline instead of guessed via toggles.
+// Usage: flip ON, create a temporary alert, wait for the dump to arrive at
+// the server, then delete the alert and flip OFF.
+debug_dump_samples  = input.bool(false, "DEBUG: fire one sample-dump webhook", group = group_display)
+
+// ── Historical sample collection ─────────────────────────────────────────────
+
+// One record per completed 4H candle. ALL measurement variants are stored so
+// the active toggles select at read time and the debug dump can export the
+// full per-candle picture for offline rule-solving.
+type ZoneSample
+    int   slot_index
+    bool  is_bullish
+    bool  late_manipulation
+    float manipulation_size
+    float expansion_size
+    float range_size
+    float close_trim_size
+    float extreme_trim_size
+    int   open_time
+
+var array<ZoneSample> historical_samples = array.new<ZoneSample>()
+
+// WHY slots: Statmap's description says it studies "specific candles within
+// the chosen timeframe" — the 02:00 candle behaves differently from the 14:00
+// candle, so statistics are grouped by the candle's clock time. Anchored to
+// New York time per the project-wide rule; any consistent anchor yields the
+// same grouping.
+f_slot_index(_open_time) =>
+    int((hour(_open_time, "America/New_York") * 60 + minute(_open_time, "America/New_York")) / 240)
+
+// ── Statistics for the current candle ────────────────────────────────────────
+
+// Percent mode normalizes by the candle open so statistics survive years of
+// price drift — a 100-point wick meant something different at NQ 10000.
+// (Global scope: Pine forbids function declarations inside local blocks.)
+f_normalized_size(_raw, _base) =>
+    use_percent_mode ? _raw / _base * 100 : _raw
+
+// The distribution value a sample contributes under the ACTIVE toggles.
+f_sample_distribution_value(_s) =>
+    result = _s.range_size
+    if use_sequence_aware_distribution
+        result := _s.late_manipulation ? (use_post_manip_extreme ? _s.extreme_trim_size : _s.close_trim_size) : _s.range_size
+    else if not use_full_range_distribution
+        result := _s.expansion_size
+    result
+
+f_median(_values) =>
+    n = array.size(_values)
+    result = float(na)
+    if n > 0
+        if use_lower_middle_median and n % 2 == 0
+            sorted_copy = array.copy(_values)
+            array.sort(sorted_copy, order.ascending)
+            result := array.get(sorted_copy, int(n / 2) - 1)
+        else
+            result := array.median(_values)
+    result
+
+// Walk the sample store newest-first and collect up to `lookback_samples`
+// values matching the current slot (and direction, when the direction
+// hypothesis is on). Returns [mean, median, count].
+f_collect_stats(_slot, _want_bullish, _use_manipulation) =>
+    values = array.new<float>()
+    window_count = 0
+    skipped_count = 0
+    sample_count = array.size(historical_samples)
+    if sample_count > 0
+        for i = sample_count - 1 to 0
+            // Window-then-split: the lookback caps the shared candle WINDOW,
+            // and the direction filter selects within it. Legacy mode caps
+            // the matched-value count instead (fills lookback per direction).
+            if (use_window_then_split ? window_count : array.size(values)) >= lookback_samples
+                break
+            s = array.get(historical_samples, i)
+            slot_matches = not use_per_slot_stats or s.slot_index == _slot
+            if slot_matches
+                // Calibration window offset: drop the N most recent candles
+                // before the window starts counting.
+                if skipped_count < window_offset_candles
+                    skipped_count += 1
+                else
+                    window_count += 1
+                    direction_matches = not use_direction_split or s.is_bullish == _want_bullish
+                    if direction_matches
+                        array.push(values, _use_manipulation ? s.manipulation_size : f_sample_distribution_value(s))
+    n = array.size(values)
+    mean_value = n > 0 ? array.avg(values) : na
+    median_value = f_median(values)
+    [mean_value, median_value, n, window_count]
+
+// ── Slot durations & shared helpers ──────────────────────────────────────────
+
+// WHY per-slot durations: CME equity futures halt at 17:00 NY, so the 14:00
+// candle is ALWAYS 180 minutes — a flat 240-minute check would silently
+// exclude every 14:00 candle (the strategy's secondary setup window) from
+// the sample. Holiday early closes still fail their own slot's expectation
+// and are excluded (e.g. a 13:00 early close prints a short slot-2 bar).
+FINAL_SESSION_SLOT = 3
+f_expected_bar_milliseconds(_slot) =>
+    _slot == FINAL_SESSION_SLOT ? 180 * 60 * 1000 : 240 * 60 * 1000
+
+// Epoch-anchored 5-minute bucket index — the shared sequence granularity.
+f_sub5(_t) =>
+    int(_t / 300000)
+
+// ── Multi-timeframe 4H sources ───────────────────────────────────────────────
+
+// Declared before every consumer — Pine has no hoisting.
+// Last COMPLETED 4H candle, non-repainting ([1] + lookahead_on is the
+// standard confirmed-HTF pattern), plus the current 4H candle's open/time
+// (safe with lookahead: an open is fixed the moment its candle starts).
+[h4_prev_open, h4_prev_high, h4_prev_low, h4_prev_close, h4_prev_time, h4_prev_time_close] = request.security(syminfo.tickerid, "240", [open[1], high[1], low[1], close[1], time[1], time_close[1]], lookahead = barmerge.lookahead_on)
+[h4_open_now, h4_time_now] = request.security(syminfo.tickerid, "240", [open, time], lookahead = barmerge.lookahead_on)
+
+// The open/time every projection anchors to — native bar on the host chart,
+// the current 4H candle via security on viewer charts.
+projection_open = is_host_4h ? open : h4_open_now
+projection_time = is_host_4h ? time : h4_time_now
+
+// ── Intrabar sequence data ───────────────────────────────────────────────────
+
+// 5-minute slices reveal which extreme printed first. TradingView's intrabar
+// budget (~100k) covers ~2,000 recent 4H bars — far more than the window
+// needs; bars beyond the budget return empty arrays → full-range fallback.
+// The requested TF must not exceed the chart TF (runtime error otherwise):
+// below 5m the request degrades to the chart TF, whose open-time bucket
+// stamp is already exact on grid-compatible TFs (15s/30s/1m).
+sequence_slice_tf = timeframe.in_seconds() >= timeframe.in_seconds("5") ? "5" : timeframe.period
+intrabar_highs = request.security_lower_tf(syminfo.tickerid, sequence_slice_tf, high)
+intrabar_lows  = request.security_lower_tf(syminfo.tickerid, sequence_slice_tf, low)
+intrabar_times = request.security_lower_tf(syminfo.tickerid, sequence_slice_tf, time)
+
+// WHY this guard: viewers cannot reconstruct the post-manipulation extreme,
+// so a viewer with that calibration toggle ON would silently compute
+// different bands than the host. Fail loudly instead.
+if not is_host_4h and use_post_manip_extreme
+    runtime.error("Post-manip extreme trim is not reconstructible on viewer charts — turn the toggle off or use the 4H chart")
+
+// ── Viewer sample reconstruction ─────────────────────────────────────────────
+
+// Runs BEFORE the statistics so the viewer's window includes the
+// just-completed candle from the first chart bar of each new 4H candle —
+// matching what the host broadcast at that open. The viewer only ever
+// pushes the PREVIOUS, already-completed candle, so this ordering has zero
+// look-ahead. (The HOST push stays after the stats for its own
+// no-self-inclusion guarantee — see the sample collection section.)
+var float tracked_high = na
+var float tracked_low = na
+var int tracked_high_sub5 = na
+var int tracked_low_sub5 = na
+var int tracked_bucket_time = na
+var bool tracked_from_open = false
+var bool viewer_first_bucket_seen = false
+
+// Chart TFs that do not tile the 5-minute grid (2m/3m/4m) cannot stamp 5m
+// buckets correctly — their samples degrade to the full-range fallback
+// rather than risk a WRONG late flag.
+viewer_tf_grid_compatible = timeframe.in_seconds() >= 300 or 300 % timeframe.in_seconds() == 0
+
+if not is_host_4h
+    viewer_new_bucket = h4_time_now != nz(tracked_bucket_time)
+    // Finalize the just-completed candle. The FIRST tracked bucket is always
+    // dropped: its extremes may predate loaded chart history.
+    if viewer_new_bucket and not na(tracked_bucket_time) and not na(h4_prev_open)
+        viewer_bull = h4_prev_close >= h4_prev_open
+        viewer_doji = h4_prev_close == h4_prev_open
+        viewer_manip = viewer_bull ? h4_prev_open - h4_prev_low : h4_prev_high - h4_prev_open
+        viewer_expansion = viewer_bull ? h4_prev_high - h4_prev_open : h4_prev_open - h4_prev_low
+        viewer_range = h4_prev_high - h4_prev_low
+        // Sequence trusted only when the tracker watched the candle from its
+        // open, captured its true extremes, the chart TF stamps 5m buckets
+        // correctly, and the extremes landed in different buckets.
+        tracker_complete = not na(tracked_high) and not na(tracked_low) and tracked_high == h4_prev_high and tracked_low == h4_prev_low
+        viewer_sequence_known = tracker_complete and tracked_from_open and viewer_tf_grid_compatible and tracked_high_sub5 != tracked_low_sub5
+        viewer_late = viewer_sequence_known and (viewer_bull ? tracked_high_sub5 < tracked_low_sub5 : tracked_low_sub5 < tracked_high_sub5)
+        viewer_close_trim = viewer_late ? (viewer_bull ? h4_prev_close - h4_prev_low : h4_prev_high - h4_prev_close) : viewer_range
+        // extreme-trim is not reconstructible here; close-trim stands in and
+        // the guard above forbids any config that would read it.
+        viewer_regular = (h4_prev_time_close - h4_prev_time) == f_expected_bar_milliseconds(f_slot_index(h4_prev_time))
+        viewer_passes = (not skip_irregular_bars or viewer_regular) and (include_doji_candles or not viewer_doji)
+        if viewer_passes and viewer_first_bucket_seen
+            array.push(historical_samples, ZoneSample.new(f_slot_index(h4_prev_time), viewer_bull, viewer_late, f_normalized_size(viewer_manip, h4_prev_open), f_normalized_size(viewer_expansion, h4_prev_open), f_normalized_size(viewer_range, h4_prev_open), f_normalized_size(viewer_close_trim, h4_prev_open), f_normalized_size(viewer_close_trim, h4_prev_open), h4_prev_time))
+        viewer_first_bucket_seen := true
+    if viewer_new_bucket
+        tracked_bucket_time := h4_time_now
+        // A bucket is only "watched from its open" when its first chart bar
+        // opens exactly at the 4H open — automatically false for straddling
+        // TFs (45m/3h) and for history starting mid-candle.
+        tracked_from_open := time == h4_time_now
+        tracked_high := na
+        tracked_low := na
+        tracked_high_sub5 := na
+        tracked_low_sub5 := na
+    // Slice-driven extreme tracking: on 5m+ charts the slices ARE true 5m
+    // pieces (exact host parity on 15m/30m/1h/2h viewers); on smaller TFs
+    // the slices equal the chart bar, already grid-exact on 15s/30s/1m.
+    viewer_slice_count = math.min(array.size(intrabar_highs), math.min(array.size(intrabar_lows), array.size(intrabar_times)))
+    if viewer_slice_count > 0
+        for i = 0 to viewer_slice_count - 1
+            slice_high = array.get(intrabar_highs, i)
+            slice_low = array.get(intrabar_lows, i)
+            slice_bucket = f_sub5(array.get(intrabar_times, i))
+            if na(tracked_high) or slice_high > tracked_high
+                tracked_high := slice_high
+                tracked_high_sub5 := slice_bucket
+            if na(tracked_low) or slice_low < tracked_low
+                tracked_low := slice_low
+                tracked_low_sub5 := slice_bucket
+    else
+        // Intrabar budget exhausted for this bar: bar-level stamping fallback.
+        if na(tracked_high) or high > tracked_high
+            tracked_high := high
+            tracked_high_sub5 := f_sub5(time)
+        if na(tracked_low) or low < tracked_low
+            tracked_low := low
+            tracked_low_sub5 := f_sub5(time)
+
+current_slot = f_slot_index(projection_time)
+
+// Direction semantics — STATMAP'S OWN CONVENTION (read off the live chart,
+// 2026-07-04): [+] / [-] name the CANDLE-DIRECTION SCENARIO, not the side of
+// price. A bullish candle manipulates DOWN first then distributes UP, so
+// [+] Manipulation projects BELOW the open and [+] Distribution ABOVE it;
+// the [-] zones mirror. Each zone pairs with its scenario's candles when the
+// direction hypothesis is on.
+[plus_manip_mean,  plus_manip_median,  plus_manip_n,  plus_manip_window]  = f_collect_stats(current_slot, true,  true)   // bull manipulation → below open
+[minus_manip_mean, minus_manip_median, minus_manip_n, minus_manip_window] = f_collect_stats(current_slot, false, true)   // bear manipulation → above open
+[plus_dist_mean,   plus_dist_median,   plus_dist_n,   plus_dist_window]   = f_collect_stats(current_slot, true,  false)  // bull distribution → above open
+[minus_dist_mean,  minus_dist_median,  minus_dist_n,  minus_dist_window]  = f_collect_stats(current_slot, false, false)  // bear distribution → below open
+
+f_index_of_extreme(_values, _find_max) =>
+    extreme_index = -1
+    extreme_value = float(na)
+    value_count = array.size(_values)
+    if value_count > 0
+        for i = 0 to value_count - 1
+            v = array.get(_values, i)
+            is_new_extreme = na(extreme_value) or (_find_max ? v > extreme_value : v < extreme_value)
+            if is_new_extreme
+                extreme_value := v
+                extreme_index := i
+    extreme_index
+
+// The most extreme value at or after a given intrabar index — the
+// post-manipulation extreme for the extreme-based trim variant.
+f_extreme_after(_values, _start_index, _find_max) =>
+    extreme_value = float(na)
+    value_count = array.size(_values)
+    if value_count > 0 and _start_index >= 0
+        for i = _start_index to value_count - 1
+            v = array.get(_values, i)
+            if na(extreme_value) or (_find_max ? v > extreme_value : v < extreme_value)
+                extreme_value := v
+    extreme_value
+
+// ── Sample collection ────────────────────────────────────────────────────────
+// DELIBERATELY placed AFTER the statistics above: Pine executes top to bottom
+// each bar, so a candle's own sample must be appended only after that
+// candle's zones were computed — otherwise every historical candle's zones
+// would include the candle itself (look-ahead), and the calibration surface
+// would differ from what the alert broadcasts at the open.
+
+is_regular_bar = (time_close - time) == f_expected_bar_milliseconds(f_slot_index(time))
+
+// Per-bar measurements at global scope so both the sample store AND the
+// hidden export plots see them.
+candle_is_bullish = close >= open
+manipulation_raw = candle_is_bullish ? open - low : high - open
+expansion_raw = candle_is_bullish ? high - open : open - low
+full_range_raw = high - low
+// Which extreme printed first? Ties (both in one 5m slice) and missing
+// intrabar data leave the sequence unknown → fall back to full range.
+index_of_high = f_index_of_extreme(intrabar_highs, true)
+index_of_low  = f_index_of_extreme(intrabar_lows, false)
+sequence_known = index_of_high >= 0 and index_of_low >= 0 and index_of_high != index_of_low
+late_manipulation = sequence_known and (candle_is_bullish ? index_of_high < index_of_low : index_of_low < index_of_high)
+// Both trim variants are computed and stored for every candle; the active
+// toggles choose at read time and the exports carry all of them.
+close_trim_raw = late_manipulation ? (candle_is_bullish ? close - low : high - close) : full_range_raw
+extreme_trim_raw = close_trim_raw
+if late_manipulation
+    post_high_after_low = f_extreme_after(intrabar_highs, index_of_low, true)
+    post_low_after_high = f_extreme_after(intrabar_lows, index_of_high, false)
+    extreme_based = candle_is_bullish ? post_high_after_low - low : high - post_low_after_high
+    extreme_trim_raw := na(extreme_based) ? close_trim_raw : extreme_based
+bar_passes_sample_filters = (not skip_irregular_bars or is_regular_bar) and (include_doji_candles or close != open)
+
+// HOST MODE — collect each native 4H candle exactly once, at confirmed close.
+if is_host_4h and barstate.isconfirmed and bar_passes_sample_filters
+    array.push(historical_samples, ZoneSample.new(f_slot_index(time), candle_is_bullish, late_manipulation, f_normalized_size(manipulation_raw, open), f_normalized_size(expansion_raw, open), f_normalized_size(full_range_raw, open), f_normalized_size(close_trim_raw, open), f_normalized_size(extreme_trim_raw, open), time))
+
+    // Cap memory, evicting oldest first. Sized generously: with the
+    // direction-split hypothesis on, the rarer direction in a slot needs far
+    // more than 120 chronological samples to yield 60 of its own — 6000
+    // (~1000 per slot) keeps that safe while staying bounded.
+    if array.size(historical_samples) > 6000
+        array.shift(historical_samples)
+
+// Project a size statistic from the current 4H candle open to a price level.
+// projection_open is the native open on the host chart and the security-
+// delivered 4H open on viewer charts — same anchor either way.
+f_project_below(_size_stat) =>
+    use_percent_mode ? projection_open * (1 - _size_stat / 100) : projection_open - _size_stat
+f_project_above(_size_stat) =>
+    use_percent_mode ? projection_open * (1 + _size_stat / 100) : projection_open + _size_stat
+
+// The band spans the mean and median projections, whichever order they land in.
+plus_manipulation_top     = math.max(f_project_below(plus_manip_mean),  f_project_below(plus_manip_median))
+plus_manipulation_bottom  = math.min(f_project_below(plus_manip_mean),  f_project_below(plus_manip_median))
+minus_manipulation_top    = math.max(f_project_above(minus_manip_mean), f_project_above(minus_manip_median))
+minus_manipulation_bottom = math.min(f_project_above(minus_manip_mean), f_project_above(minus_manip_median))
+plus_distribution_top     = math.max(f_project_above(plus_dist_mean),   f_project_above(plus_dist_median))
+plus_distribution_bottom  = math.min(f_project_above(plus_dist_mean),   f_project_above(plus_dist_median))
+minus_distribution_top    = math.max(f_project_below(minus_dist_mean),  f_project_below(minus_dist_median))
+minus_distribution_bottom = math.min(f_project_below(minus_dist_mean),  f_project_below(minus_dist_median))
+
+// WHY the viewer needs a FULL window: a shallow chart history (short 1m/15s
+// loads) would silently compute bands from fewer candles than the host
+// broadcast to the server — different means AND medians, with no warning.
+// Viewers therefore hide bands entirely until their window depth matches
+// the host's lookback (review finding).
+plus_manipulation_valid  = plus_manip_n  >= minimum_samples and (is_host_4h or plus_manip_window  >= lookback_samples)
+minus_manipulation_valid = minus_manip_n >= minimum_samples and (is_host_4h or minus_manip_window >= lookback_samples)
+plus_distribution_valid  = plus_dist_n   >= minimum_samples and (is_host_4h or plus_dist_window   >= lookback_samples)
+minus_distribution_valid = minus_dist_n  >= minimum_samples and (is_host_4h or minus_dist_window  >= lookback_samples)
+
+// ── Zone-levels webhook ──────────────────────────────────────────────────────
+
+f_price_string(_price) =>
+    na(_price) ? "na" : str.tostring(_price, format.mintick)
+
+f_zone_json(_valid, _top, _bottom) =>
+    '{"enabled":' + (_valid ? "true" : "false") +
+     ',"high":"' + f_price_string(_top) +
+     '","low":"' + f_price_string(_bottom) + '"}'
+
+f_levels_payload() =>
+    '{"indicator":"ZONES","event":"levels"' +
+     ',"symbol":"' + syminfo.ticker + '"' +
+     ',"chart_timeframe":"' + timeframe.period + '"' +
+     ',"h4_open":"' + f_price_string(projection_open) + '"' +
+     ',"h4_open_time_ny":"' + str.format_time(projection_time, "yyyy-MM-dd HH:mm:ss", "America/New_York") + '"' +
+     ',"slot":"' + str.tostring(current_slot) + '"' +
+     ',"zones":{' +
+     '"plus_manipulation":'  + f_zone_json(plus_manipulation_valid,  plus_manipulation_top,  plus_manipulation_bottom)  + ',' +
+     '"minus_manipulation":' + f_zone_json(minus_manipulation_valid, minus_manipulation_top, minus_manipulation_bottom) + ',' +
+     '"plus_distribution":'  + f_zone_json(plus_distribution_valid,  plus_distribution_top,  plus_distribution_bottom)  + ',' +
+     '"minus_distribution":' + f_zone_json(minus_distribution_valid, minus_distribution_top, minus_distribution_bottom) + '}' +
+     ',"config":{"lookback":"' + str.tostring(lookback_samples) + '","percent":' + (use_percent_mode ? "true" : "false") +
+     ',"per_slot":' + (use_per_slot_stats ? "true" : "false") + ',"direction_split":' + (use_direction_split ? "true" : "false") +
+     ',"window_then_split":' + (use_window_then_split ? "true" : "false") +
+     ',"full_range_distribution":' + (use_full_range_distribution ? "true" : "false") +
+     ',"sequence_aware_distribution":' + (use_sequence_aware_distribution ? "true" : "false") + '}}'
+
+// WHY freq_once_per_bar (an exception to the bar-CLOSE rule): the levels are
+// fully determined the moment the 4H candle opens, and the server must hold
+// this geometry BEFORE price trades the candle. One deterministic broadcast
+// per candle, at the open; it also fires immediately when the alert is first
+// created mid-candle, so the server is never blind for the current candle.
+// HOST ONLY: viewer instances must never publish — a webhook from a viewer
+// would double-broadcast geometry built from a shallower sample history.
+if fire_level_alerts and barstate.isrealtime and is_host_4h
+    alert(f_levels_payload(), alert.freq_once_per_bar)
+
+// ── Debug sample dump ────────────────────────────────────────────────────────
+
+// One compact record per window candle, newest first:
+// openTime;manip;range;closeTrim;extremeTrim;late  — all sizes in the active
+// unit (percent by default), 4 decimals. Parsed server-side for rule solving.
+f_dump_payload() =>
+    sample_lines = ""
+    total = array.size(historical_samples)
+    exported = 0
+    if total > 0
+        for i = total - 1 to 0
+            if exported >= lookback_samples + window_offset_candles
+                break
+            s = array.get(historical_samples, i)
+            sample_lines := sample_lines + str.format_time(s.open_time, "MMdd-HH", "America/New_York") + ";" +
+                 str.tostring(s.manipulation_size, "#.####") + ";" +
+                 str.tostring(s.range_size, "#.####") + ";" +
+                 str.tostring(s.close_trim_size, "#.####") + ";" +
+                 str.tostring(s.extreme_trim_size, "#.####") + ";" +
+                 (s.late_manipulation ? "1" : "0") + "|"
+            exported += 1
+    '{"indicator":"ZONES","event":"debug_dump"' +
+     ',"h4_open":"' + f_price_string(projection_open) + '"' +
+     ',"h4_open_time_ny":"' + str.format_time(projection_time, "yyyy-MM-dd HH:mm:ss", "America/New_York") + '"' +
+     ',"format":"openTimeNY;manip;range;closeTrim;extremeTrim;late — newest first"' +
+     ',"samples":"' + sample_lines + '"}'
+
+if debug_dump_samples and barstate.isrealtime and is_host_4h
+    alert(f_dump_payload(), alert.freq_once_per_bar)
+
+// ── On-chart bands (calibration against Statmap) ────────────────────────────
+
+// Drawn so the trader can overlay this indicator with Statmap and check the
+// projections coincide 1:1 before trusting the published geometry.
+f_draw_band(_valid, _top, _bottom, _band_color) =>
+    var box band = na
+    if _valid and na(band)
+        band := box.new(bar_index, _top, bar_index + 2, _bottom, xloc = xloc.bar_index, extend = extend.right, border_color = _band_color, bgcolor = color.new(_band_color, 85))
+    if _valid and not na(band)
+        box.set_lefttop(band, bar_index, _top)
+        box.set_rightbottom(band, bar_index + 2, _bottom)
+    if not _valid and not na(band)
+        box.delete(band)
+        band := na
+
+f_draw_band(plus_manipulation_valid,  plus_manipulation_top,  plus_manipulation_bottom,  color.green)
+f_draw_band(minus_manipulation_valid, minus_manipulation_top, minus_manipulation_bottom, color.red)
+f_draw_band(plus_distribution_valid,  plus_distribution_top,  plus_distribution_bottom,  color.orange)
+f_draw_band(minus_distribution_valid, minus_distribution_top, minus_distribution_bottom, color.teal)
+
+// ── Historical bands ─────────────────────────────────────────────────────────
+
+// When a new 4H candle begins, freeze the just-completed candle's bands as
+// dimmed boxes spanning ONLY that candle's time range ([1] values = the bands
+// as computed during that candle = what the alert broadcast at its open).
+// Trimmed to the configured depth so the chart never accumulates clutter.
+var array<box> historical_band_boxes = array.new<box>()
+
+f_freeze_band(_was_valid, _top_prev, _bottom_prev, _start_time, _end_time, _band_color) =>
+    if _was_valid
+        frozen = box.new(_start_time, _top_prev, _end_time, _bottom_prev, xloc = xloc.bar_time, border_color = color.new(_band_color, 40), bgcolor = color.new(_band_color, 90))
+        array.push(historical_band_boxes, frozen)
+
+// Gated on confirmed executions only: realtime ticks re-run the script many
+// times per bar, and box creation/trimming must happen exactly once per event.
+// HOST: freeze the closing candle's own bands the moment it completes.
+if historical_bands_to_keep > 0 and is_host_4h and barstate.isconfirmed
+    f_freeze_band(plus_manipulation_valid,  plus_manipulation_top,  plus_manipulation_bottom,  time, time_close, color.green)
+    f_freeze_band(minus_manipulation_valid, minus_manipulation_top, minus_manipulation_bottom, time, time_close, color.red)
+    f_freeze_band(plus_distribution_valid,  plus_distribution_top,  plus_distribution_bottom,  time, time_close, color.orange)
+    f_freeze_band(minus_distribution_valid, minus_distribution_top, minus_distribution_bottom, time, time_close, color.teal)
+// VIEWER: freeze the just-ended 4H bucket's bands on the first confirmed
+// chart bar of the new bucket ([1] values = as displayed during that bucket).
+if historical_bands_to_keep > 0 and not is_host_4h and barstate.isconfirmed and h4_time_now != h4_time_now[1] and bar_index > 0
+    f_freeze_band(plus_manipulation_valid[1],  plus_manipulation_top[1],  plus_manipulation_bottom[1],  h4_prev_time, h4_prev_time_close, color.green)
+    f_freeze_band(minus_manipulation_valid[1], minus_manipulation_top[1], minus_manipulation_bottom[1], h4_prev_time, h4_prev_time_close, color.red)
+    f_freeze_band(plus_distribution_valid[1],  plus_distribution_top[1],  plus_distribution_bottom[1],  h4_prev_time, h4_prev_time_close, color.orange)
+    f_freeze_band(minus_distribution_valid[1], minus_distribution_top[1], minus_distribution_bottom[1], h4_prev_time, h4_prev_time_close, color.teal)
+if historical_bands_to_keep > 0 and barstate.isconfirmed
+    while array.size(historical_band_boxes) > historical_bands_to_keep * 4
+        box.delete(array.shift(historical_band_boxes))
+
+// ── Calibration table ────────────────────────────────────────────────────────
+
+// Side-by-side numbers beat eyeballing lines: compare these values against
+// Statmap's own table/labels and report mismatches during the calibration loop.
+var table calibration_table = table.new(position.top_right, 4, 5, border_width = 1)
+
+// Global scope: Pine forbids function declarations inside local blocks.
+f_table_row(_row, _name, _top, _bottom, _n) =>
+    table.cell(calibration_table, 0, _row, _name, text_size = size.small)
+    table.cell(calibration_table, 1, _row, f_price_string(_top), text_size = size.small)
+    table.cell(calibration_table, 2, _row, f_price_string(_bottom), text_size = size.small)
+    table.cell(calibration_table, 3, _row, str.tostring(_n), text_size = size.small)
+
+if barstate.islast and show_table
+    table.cell(calibration_table, 0, 0, "zone",    text_size = size.small)
+    table.cell(calibration_table, 1, 0, "band hi", text_size = size.small)
+    table.cell(calibration_table, 2, 0, "band lo", text_size = size.small)
+    table.cell(calibration_table, 3, 0, "n",       text_size = size.small)
+    // Row order mirrors Statmap's on-chart stack (top to bottom:
+    // +D, -M, open, +M, -D) so the two tables diff at a glance.
+    f_table_row(1, "[+] Dis", plus_distribution_top,  plus_distribution_bottom,  plus_dist_n)
+    f_table_row(2, "[-] Man", minus_manipulation_top, minus_manipulation_bottom, minus_manip_n)
+    f_table_row(3, "[+] Man", plus_manipulation_top,  plus_manipulation_bottom,  plus_manip_n)
+    f_table_row(4, "[-] Dis", minus_distribution_top, minus_distribution_bottom, minus_dist_n)
+
+// ── Hidden export plots ──────────────────────────────────────────────────────
+
+// Not drawn on the chart — they exist so TradingView's "Export chart data…"
+// writes the per-candle measurements to CSV for offline rule-solving.
+// Works with the market closed, unlike webhook dumps. HOST-GATED: on a
+// viewer chart these per-bar values would describe 1m bars under names that
+// mean 4H measurements, poisoning any offline analysis (review finding).
+plot(is_host_4h ? f_normalized_size(manipulation_raw, open) : na, "manip_size",        display = display.data_window)
+plot(is_host_4h ? f_normalized_size(full_range_raw, open) : na,   "range_size",        display = display.data_window)
+plot(is_host_4h ? f_normalized_size(close_trim_raw, open) : na,   "close_trim_size",   display = display.data_window)
+plot(is_host_4h ? f_normalized_size(extreme_trim_raw, open) : na, "extreme_trim_size", display = display.data_window)
+plot(is_host_4h ? (late_manipulation ? 1 : 0) : na,               "late_manipulation", display = display.data_window)
+plot(is_host_4h ? (bar_passes_sample_filters ? 1 : 0) : na,       "in_sample",         display = display.data_window)

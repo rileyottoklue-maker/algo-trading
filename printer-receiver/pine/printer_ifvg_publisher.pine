@@ -1,0 +1,412 @@
+//@version=6
+indicator("Printer — SMT+IFVG Publisher", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ATTRIBUTION
+// Inversion-trigger concept adapted from "ICT iFVG Detector and Alert
+// [by ote618]" © ote618, Mozilla Public License 2.0
+// (https://mozilla.org/MPL/2.0/). Notice retained per MPL §3.3.
+//
+// WHY THIS EXISTS
+// The strategy's combined trigger engine (trader-designed 2026-07-05):
+//   1. SMT layers (1m + 15m, via security) detect divergences and define
+//      the SMT LEG — the window between the two swings.
+//   2. Every 15s FVG is collected; when an SMT forms, the CANDIDATE gap is
+//      the EXTREME FVG on that leg — the LOWEST down-gap for bullish, the
+//      HIGHEST up-gap for bearish ("use the lowest or highest IFVG on the
+//      SMT legs").
+//   3. RELEASE = a 15s close back through the candidate gap (the inversion).
+// Origination is STRUCTURAL: no SMT leg, no candidate, no trigger.
+//
+//   HOST (15s chart): native bars; the ONLY instance that fires webhooks.
+//   VIEWER (charts up to 15m): replays the same engine over 15s slices —
+//   marks only, never alerts.
+// Marks additionally require the armed context (zone tapped + SMT recent);
+// webhooks are NEVER filtered — the server's state machine owns arming.
+// ─────────────────────────────────────────────────────────────────────────────
+
+group_detect = "Detection"
+group_filter = "Mark filter (display only)"
+group_mtf = "Additional raw iFVG streams (host only)"
+group_display = "Display / alerts"
+
+// WHY: the protective level behind a release is the extreme of the move
+// that created it (host-only; vendor-parity numbers).
+stop_lookback_bars = input.int(40, "Stop swing lookback (15s bars)", minval = 5, group = group_detect)
+// WHY 3: BESW reads the vendor's "Liquidity: 1m" — 1m swing structure.
+besw_pivot_length = input.int(3, "BESW 1m pivot lookback", minval = 1, group = group_detect)
+smt_comparison_symbol = input.symbol("CME_MINI:ES1!", "SMT comparison symbol", group = group_detect)
+smt_pivot_length = input.int(1, "SMT layer pivot lookback", minval = 1, group = group_detect)
+// WHY: gaps printing slightly after the second swing still belong to the
+// leg's terminal push.
+leg_slack_minutes = input.int(2, "Leg window slack (minutes)", minval = 0, group = group_detect)
+// WHY: a candidate that never releases goes stale with its SMT.
+candidate_max_age_minutes = input.int(30, "Candidate max age (minutes)", minval = 1, group = group_detect)
+
+mark_filter_mode = input.string("Armed setups", "Mark filter", options = ["Armed setups", "Off"], group = group_filter)
+zone_tap_recency_minutes = input.int(30, "Zone tap recency (minutes)", minval = 1, group = group_filter)
+smt_recency_minutes = input.int(30, "SMT recency (minutes)", minval = 1, group = group_filter)
+
+// WHY off by default: raw ote618-style iFVG streams on higher TFs are
+// optional context; the strategy's trigger is the SMT-leg engine above.
+raw_validation_window_bars = input.int(5, "Raw stream validation window (bars)", minval = 1, group = group_mtf)
+alert_tf_1m  = input.bool(false, "1m raw stream", group = group_mtf)
+alert_tf_5m  = input.bool(false, "5m raw stream", group = group_mtf)
+alert_tf_15m = input.bool(false, "15m raw stream", group = group_mtf)
+
+fire_release_alerts = input.bool(true, "Fire release webhooks (host only)", group = group_display)
+show_marks          = input.bool(true, "Draw releases + candidate gaps", group = group_display)
+show_zone_bands     = input.bool(true, "Highlight manipulation bands", group = group_display)
+
+is_host_15s = timeframe.in_seconds() == 15
+if timeframe.in_seconds() > timeframe.in_seconds("15")
+    runtime.error("Printer — SMT+IFVG Publisher runs on 15S (host) up to 15m (viewer) charts")
+
+// ── 15-second data source (viewer reconstruction) ────────────────────────────
+
+slice_tf = is_host_15s ? timeframe.period : "15S"
+slice_highs  = request.security_lower_tf(syminfo.tickerid, slice_tf, high)
+slice_lows   = request.security_lower_tf(syminfo.tickerid, slice_tf, low)
+slice_closes = request.security_lower_tf(syminfo.tickerid, slice_tf, close)
+slice_times  = request.security_lower_tf(syminfo.tickerid, slice_tf, time)
+slice_close_times = request.security_lower_tf(syminfo.tickerid, slice_tf, time_close)
+
+// ── 1-minute swings for BESW ─────────────────────────────────────────────────
+
+f_held_1m_swings() =>
+    ph = ta.pivothigh(besw_pivot_length, besw_pivot_length)
+    pl = ta.pivotlow(besw_pivot_length, besw_pivot_length)
+    var float held_high = na
+    var float held_low = na
+    if not na(ph)
+        held_high := ph
+    if not na(pl)
+        held_low := pl
+    [held_high[1], held_low[1]]
+
+[m1_swing_high, m1_swing_low] = request.security(syminfo.tickerid, "1", f_held_1m_swings(), lookahead = barmerge.lookahead_off)
+
+// ── Manipulation bands + tap tracking (calibrated zone formula) ──────────────
+
+MANIP_LOOKBACK_SAMPLES = 60
+
+[current_h4_open, current_h4_time] = request.security(syminfo.tickerid, "240", [open, time], lookahead = barmerge.lookahead_on)
+[band_h4_open, band_h4_high, band_h4_low, band_h4_close, band_h4_time] = request.security(syminfo.tickerid, "240", [open[1], high[1], low[1], close[1], time[1]], lookahead = barmerge.lookahead_on)
+
+f_slot_index(_open_time) =>
+    int((hour(_open_time, "America/New_York") * 60 + minute(_open_time, "America/New_York")) / 240)
+
+var array<int> manip_sample_slots = array.new<int>()
+var array<float> manip_sample_values = array.new<float>()
+var int band_prev_bucket = na
+
+if current_h4_time != nz(band_prev_bucket)
+    if not na(band_prev_bucket) and not na(band_h4_open) and band_h4_close != band_h4_open
+        band_bull = band_h4_close >= band_h4_open
+        band_manip_raw = band_bull ? band_h4_open - band_h4_low : band_h4_high - band_h4_open
+        array.push(manip_sample_slots, f_slot_index(band_h4_time))
+        array.push(manip_sample_values, band_manip_raw / band_h4_open * 100)
+        if array.size(manip_sample_values) > 3000
+            array.shift(manip_sample_slots)
+            array.shift(manip_sample_values)
+    band_prev_bucket := current_h4_time
+
+f_manip_stats(_slot) =>
+    vals = array.new<float>()
+    total = array.size(manip_sample_values)
+    if total > 0
+        for i = total - 1 to 0
+            if array.size(vals) >= MANIP_LOOKBACK_SAMPLES
+                break
+            if array.get(manip_sample_slots, i) == _slot
+                array.push(vals, array.get(manip_sample_values, i))
+    n = array.size(vals)
+    [n > 0 ? array.avg(vals) : na, n > 0 ? array.median(vals) : na, n]
+
+[manip_mean, manip_median, manip_sample_count] = f_manip_stats(f_slot_index(current_h4_time))
+zone_bands_valid = manip_sample_count >= MANIP_LOOKBACK_SAMPLES
+
+bull_band_top    = math.max(current_h4_open * (1 - manip_mean / 100), current_h4_open * (1 - manip_median / 100))
+bull_band_bottom = math.min(current_h4_open * (1 - manip_mean / 100), current_h4_open * (1 - manip_median / 100))
+bear_band_top    = math.max(current_h4_open * (1 + manip_mean / 100), current_h4_open * (1 + manip_median / 100))
+bear_band_bottom = math.min(current_h4_open * (1 + manip_mean / 100), current_h4_open * (1 + manip_median / 100))
+
+var int last_bull_band_tap_time = na
+var int last_bear_band_tap_time = na
+if zone_bands_valid
+    if high >= bull_band_bottom and low <= bull_band_top
+        last_bull_band_tap_time := time
+    if high >= bear_band_bottom and low <= bear_band_top
+        last_bear_band_tap_time := time
+
+// ── SMT layers with leg windows (1m + 15m) ───────────────────────────────────
+
+f_held_swings() =>
+    ph = ta.pivothigh(smt_pivot_length, smt_pivot_length)
+    pl = ta.pivotlow(smt_pivot_length, smt_pivot_length)
+    var float held_high = na
+    var int   held_high_time = na
+    var float held_low = na
+    var int   held_low_time = na
+    if not na(ph)
+        held_high := ph
+        held_high_time := time[smt_pivot_length]
+    if not na(pl)
+        held_low := pl
+        held_low_time := time[smt_pivot_length]
+    [held_high[1], held_high_time[1], held_low[1], held_low_time[1]]
+
+[smt_m1_chart_high, smt_m1_chart_high_t, smt_m1_chart_low, smt_m1_chart_low_t] = request.security(syminfo.tickerid, "1", f_held_swings(), lookahead = barmerge.lookahead_off)
+[smt_m1_comp_high, smt_m1_comp_high_t, smt_m1_comp_low, smt_m1_comp_low_t] = request.security(smt_comparison_symbol, "1", f_held_swings(), lookahead = barmerge.lookahead_off)
+[smt_m15_chart_high, smt_m15_chart_high_t, smt_m15_chart_low, smt_m15_chart_low_t] = request.security(syminfo.tickerid, "15", f_held_swings(), lookahead = barmerge.lookahead_off)
+[smt_m15_comp_high, smt_m15_comp_high_t, smt_m15_comp_low, smt_m15_comp_low_t] = request.security(smt_comparison_symbol, "15", f_held_swings(), lookahead = barmerge.lookahead_off)
+
+// Break-disagreement divergence returning the LEG WINDOW (start swing time →
+// end swing time). State per call site; called unconditionally (CW10003).
+f_layer_divergence(_is_high_side, _chart_held, _chart_held_time, _comparison_held) =>
+    var float previous_chart = na
+    var int   previous_chart_time = na
+    var float previous_comparison = na
+    formed = false
+    leg_start = int(na)
+    leg_end = int(na)
+    stepped = _chart_held != _chart_held[1] or _chart_held_time != _chart_held_time[1]
+    if stepped and not na(_chart_held) and not na(_comparison_held)
+        if not na(previous_chart) and not na(previous_comparison)
+            chart_broke = _is_high_side ? _chart_held > previous_chart : _chart_held < previous_chart
+            comparison_broke = _is_high_side ? _comparison_held > previous_comparison : _comparison_held < previous_comparison
+            if chart_broke != comparison_broke
+                formed := true
+                leg_start := previous_chart_time
+                leg_end := _chart_held_time
+        previous_chart := _chart_held
+        previous_chart_time := _chart_held_time
+        previous_comparison := _comparison_held
+    [formed, leg_start, leg_end]
+
+[m1_bull_formed, m1_bull_leg_start, m1_bull_leg_end] = f_layer_divergence(false, smt_m1_chart_low, smt_m1_chart_low_t, smt_m1_comp_low)
+[m15_bull_formed, m15_bull_leg_start, m15_bull_leg_end] = f_layer_divergence(false, smt_m15_chart_low, smt_m15_chart_low_t, smt_m15_comp_low)
+[m1_bear_formed, m1_bear_leg_start, m1_bear_leg_end] = f_layer_divergence(true, smt_m1_chart_high, smt_m1_chart_high_t, smt_m1_comp_high)
+[m15_bear_formed, m15_bear_leg_start, m15_bear_leg_end] = f_layer_divergence(true, smt_m15_chart_high, smt_m15_chart_high_t, smt_m15_comp_high)
+
+var int last_bull_smt_time = na
+var int last_bear_smt_time = na
+
+// ── Gap store + candidates ───────────────────────────────────────────────────
+
+// WHY 2h retention: an SMT leg never spans longer on the traded timeframes;
+// gaps older than that can never be leg members.
+GAP_RETENTION_MS = 2 * 60 * 60 * 1000
+
+type LegGap
+    bool  is_down_gap
+    float top
+    float bottom
+    int   created_time
+
+var array<LegGap> recent_gaps = array.new<LegGap>()
+
+type Candidate
+    bool  active = false
+    float top = na
+    float bottom = na
+    int   gap_time = na
+    int   smt_time = na
+    int   armed_at = na
+
+var Candidate bull_candidate = Candidate.new()
+var Candidate bear_candidate = Candidate.new()
+
+// Select the EXTREME gap on the leg: lowest down-gap for bullish, highest
+// up-gap for bearish (trader ruling 2026-07-05).
+f_select_candidate(Candidate _candidate, bool _bullish, int _leg_start, int _leg_end, int _now) =>
+    slack_ms = leg_slack_minutes * 60 * 1000
+    best_index = -1
+    best_extreme = float(na)
+    total = array.size(recent_gaps)
+    if total > 0
+        for i = 0 to total - 1
+            g = array.get(recent_gaps, i)
+            on_leg = g.created_time >= _leg_start and g.created_time <= _leg_end + slack_ms
+            direction_matches = g.is_down_gap == _bullish
+            if on_leg and direction_matches
+                gap_extreme = _bullish ? g.bottom : g.top
+                is_more_extreme = na(best_extreme) or (_bullish ? gap_extreme < best_extreme : gap_extreme > best_extreme)
+                if is_more_extreme
+                    best_extreme := gap_extreme
+                    best_index := i
+    if best_index >= 0
+        g = array.get(recent_gaps, best_index)
+        _candidate.active := true
+        _candidate.top := g.top
+        _candidate.bottom := g.bottom
+        _candidate.gap_time := g.created_time
+        _candidate.smt_time := _now
+        _candidate.armed_at := _now
+
+// ── Payloads (host only) ─────────────────────────────────────────────────────
+
+f_price_string(float _price) =>
+    na(_price) ? "na" : str.tostring(_price, format.mintick)
+
+f_time_string(int _t) =>
+    na(_t) ? "na" : str.format_time(_t, "yyyy-MM-dd HH:mm:ss", "America/New_York")
+
+f_ifvg_payload(string _tf_label, bool _bullish, float _gap_top, float _gap_bottom, int _gap_time, int _smt_time, float _entry, float _stop, float _besw, int _bar_close_time) =>
+    '{"indicator":"IFVG","event":"active","source":"printer"' +
+     ',"type":"' + (_bullish ? "Bullish" : "Bearish") + '"' +
+     ',"symbol":"' + syminfo.ticker + '"' +
+     ',"timeframe":"' + _tf_label + '"' +
+     ',"gap_top":"' + f_price_string(_gap_top) + '"' +
+     ',"gap_bottom":"' + f_price_string(_gap_bottom) + '"' +
+     ',"gap_time_ny":"' + f_time_string(_gap_time) + '"' +
+     ',"smt_time_ny":"' + f_time_string(_smt_time) + '"' +
+     ',"entry":"' + f_price_string(_entry) + '"' +
+     ',"stop":"' + f_price_string(_stop) + '"' +
+     ',"besw":"' + f_price_string(_besw) + '"' +
+     ',"bar_close_time_ny":"' + f_time_string(_bar_close_time) + '"}'
+
+// ── Armed display filter ─────────────────────────────────────────────────────
+
+f_setup_armed(_tap_time, _smt_time) =>
+    tap_fresh = not na(_tap_time) and time - _tap_time <= zone_tap_recency_minutes * 60 * 1000
+    smt_fresh = not na(_smt_time) and time - _smt_time <= smt_recency_minutes * 60 * 1000
+    tap_fresh and smt_fresh and _smt_time >= _tap_time
+
+f_mark_allowed(_bullish) =>
+    if mark_filter_mode == "Off" or not zone_bands_valid
+        true
+    else
+        _bullish ? f_setup_armed(last_bull_band_tap_time, last_bull_smt_time) : f_setup_armed(last_bear_band_tap_time, last_bear_smt_time)
+
+// ── The 15s engine ───────────────────────────────────────────────────────────
+
+lowest_low_in_lookback   = ta.lowest(low, stop_lookback_bars)
+highest_high_in_lookback = ta.highest(high, stop_lookback_bars)
+
+// Release check for one candidate against one 15s close. Returns whether it
+// released (caller handles emission).
+f_candidate_released(Candidate _candidate, bool _bullish, float _c, int _t_open) =>
+    released = false
+    if _candidate.active
+        if _t_open - _candidate.armed_at > candidate_max_age_minutes * 60 * 1000
+            _candidate.active := false
+        else
+            released := _bullish ? _c > _candidate.top : _c < _candidate.bottom
+    released
+
+// One 15s bar: collect gaps, prune stale, test both candidates.
+f_process_15s_bar(float _h, float _l, float _c, float _h2, float _l2, int _t_open, int _t_close) =>
+    // Gap creation (classic 3-candle imbalance)
+    if not na(_h2) and not na(_l2)
+        if _h2 < _l
+            array.push(recent_gaps, LegGap.new(false, _l, _h2, _t_open))
+        if _l2 > _h
+            array.push(recent_gaps, LegGap.new(true, _l2, _h, _t_open))
+    // Prune stale gaps (oldest first)
+    while array.size(recent_gaps) > 0 and _t_open - array.get(recent_gaps, 0).created_time > GAP_RETENTION_MS
+        array.shift(recent_gaps)
+    while array.size(recent_gaps) > 400
+        array.shift(recent_gaps)
+    // Releases
+    if f_candidate_released(bull_candidate, true, _c, _t_open)
+        if is_host_15s and fire_release_alerts
+            alert(f_ifvg_payload("15S", true, bull_candidate.top, bull_candidate.bottom, bull_candidate.gap_time, bull_candidate.smt_time, _c, lowest_low_in_lookback, m1_swing_high, _t_close), alert.freq_once_per_bar_close)
+        if show_marks and f_mark_allowed(true)
+            box.new(bull_candidate.gap_time, bull_candidate.top, _t_close, bull_candidate.bottom, xloc = xloc.bar_time, border_color = color.green, bgcolor = color.new(color.green, 80))
+            label.new(_t_close, bull_candidate.bottom, "RELEASE", xloc = xloc.bar_time, style = label.style_label_up, color = color.new(color.green, 10), textcolor = color.white, size = size.small)
+        bull_candidate.active := false
+    if f_candidate_released(bear_candidate, false, _c, _t_open)
+        if is_host_15s and fire_release_alerts
+            alert(f_ifvg_payload("15S", false, bear_candidate.top, bear_candidate.bottom, bear_candidate.gap_time, bear_candidate.smt_time, _c, highest_high_in_lookback, m1_swing_low, _t_close), alert.freq_once_per_bar_close)
+        if show_marks and f_mark_allowed(false)
+            box.new(bear_candidate.gap_time, bear_candidate.top, _t_close, bear_candidate.bottom, xloc = xloc.bar_time, border_color = color.red, bgcolor = color.new(color.red, 80))
+            label.new(_t_close, bear_candidate.top, "RELEASE", xloc = xloc.bar_time, style = label.style_label_down, color = color.new(color.red, 10), textcolor = color.white, size = size.small)
+        bear_candidate.active := false
+
+// HOST: native bars, once per confirmed close.
+if is_host_15s and barstate.isconfirmed and bar_index >= 2
+    f_process_15s_bar(high, low, close, high[2], low[2], time, time_close)
+
+// VIEWER: replay this chart bar's 15s slices in order.
+var float slice_h2 = na
+var float slice_l2 = na
+var float slice_h1 = na
+var float slice_l1 = na
+if not is_host_15s and barstate.isconfirmed
+    slice_count = math.min(array.size(slice_highs), math.min(array.size(slice_lows), math.min(array.size(slice_closes), math.min(array.size(slice_times), array.size(slice_close_times)))))
+    if slice_count > 0
+        for i = 0 to slice_count - 1
+            f_process_15s_bar(array.get(slice_highs, i), array.get(slice_lows, i), array.get(slice_closes, i), slice_h2, slice_l2, array.get(slice_times, i), array.get(slice_close_times, i))
+            slice_h2 := slice_h1
+            slice_l2 := slice_l1
+            slice_h1 := array.get(slice_highs, i)
+            slice_l1 := array.get(slice_lows, i)
+
+// ── SMT formations arm the candidates ────────────────────────────────────────
+
+// After the engine ran this bar: a fresh SMT selects its leg's extreme gap.
+// (15m layer takes precedence over 1m when both form on the same bar.)
+if barstate.isconfirmed
+    if m1_bull_formed or m15_bull_formed
+        last_bull_smt_time := time
+        f_select_candidate(bull_candidate, true, m15_bull_formed ? m15_bull_leg_start : m1_bull_leg_start, m15_bull_formed ? m15_bull_leg_end : m1_bull_leg_end, time)
+    if m1_bear_formed or m15_bear_formed
+        last_bear_smt_time := time
+        f_select_candidate(bear_candidate, false, m15_bear_formed ? m15_bear_leg_start : m1_bear_leg_start, m15_bear_formed ? m15_bear_leg_end : m1_bear_leg_end, time)
+
+// ── Zone band highlight ──────────────────────────────────────────────────────
+
+f_draw_zone_band(_valid, _top, _bottom, _band_color) =>
+    var box band = na
+    if _valid and na(band)
+        band := box.new(bar_index, _top, bar_index + 2, _bottom, xloc = xloc.bar_index, extend = extend.right, border_color = _band_color, bgcolor = color.new(_band_color, 85))
+    if _valid and not na(band)
+        box.set_lefttop(band, bar_index, _top)
+        box.set_rightbottom(band, bar_index + 2, _bottom)
+    if not _valid and not na(band)
+        box.delete(band)
+        band := na
+
+f_draw_zone_band(show_zone_bands and zone_bands_valid, bull_band_top, bull_band_bottom, color.green)
+f_draw_zone_band(show_zone_bands and zone_bands_valid, bear_band_top, bear_band_bottom, color.red)
+
+// ── Additional raw iFVG streams (ote618 multi-TF pattern, host only) ─────────
+
+f_ifvg_confirm_dir() =>
+    bullish_fvg = high[2] < low
+    bearish_fvg = low[2] > high
+    var bool tf_active = false
+    var float tf_c1_high = na
+    var float tf_c1_low = na
+    var int tf_dir = 0
+    var int tf_validate_end = na
+    if bullish_fvg
+        tf_active := true
+        tf_dir := 1
+        tf_c1_high := high[2]
+        tf_c1_low := low[2]
+        tf_validate_end := bar_index + raw_validation_window_bars - 1
+    if bearish_fvg
+        tf_active := true
+        tf_dir := -1
+        tf_c1_high := high[2]
+        tf_c1_low := low[2]
+        tf_validate_end := bar_index + raw_validation_window_bars - 1
+    confirmed_dir = 0
+    if tf_active and bar_index <= tf_validate_end
+        is_confirmed = (tf_dir == 1 and close < tf_c1_high) or (tf_dir == -1 and close > tf_c1_low)
+        if is_confirmed
+            confirmed_dir := tf_dir
+            tf_active := false
+    confirmed_dir
+
+f_tf_stream(string _tf, bool _enabled, string _label) =>
+    dir = request.security(syminfo.tickerid, _tf, f_ifvg_confirm_dir(), lookahead = barmerge.lookahead_off)
+    t = request.security(syminfo.tickerid, _tf, time, lookahead = barmerge.lookahead_off)
+    if _enabled and is_host_15s and dir != 0 and not na(t) and ta.change(t) != 0 and barstate.isconfirmed
+        alert(f_ifvg_payload(_label, dir == -1, float(na), float(na), int(na), int(na), float(na), float(na), float(na), time_close), alert.freq_once_per_bar_close)
+
+f_tf_stream("1", alert_tf_1m, "1m")
+f_tf_stream("5", alert_tf_5m, "5m")
+f_tf_stream("15", alert_tf_15m, "15m")
